@@ -183,6 +183,15 @@ async function loadDashboard() {
         <div class="metric"><span>Detected Mods</span><strong>${dashboard.detectedMods}</strong><small>Active scan sources</small></div>
         <div class="metric"><span>Lore Conflicts</span><strong>${dashboard.conflictsFound}</strong><small>Awaiting review</small></div>
         <div class="metric"><span>Active Player Profile</span><strong>${dashboard.activePlayerProfile ? escapeHtml(dashboard.activePlayerProfile.profileName) : "None"}</strong><small>${dashboard.activePlayerProfile ? `${escapeHtml(dashboard.activePlayerProfile.farmerName)} · ${escapeHtml(dashboard.activePlayerProfile.farmName)}${dashboard.activePlayerProfile.linkedSaveFile ? ` · save: ${escapeHtml(dashboard.activePlayerProfile.linkedSaveFile)}` : ""}` : "Set one on Player Profiles"}</small></div>`;
+    const profileDetail = dashboard.activePlayerProfile
+        ? `${escapeHtml(dashboard.activePlayerProfile.farmerName)} - ${escapeHtml(dashboard.activePlayerProfile.farmName)}${dashboard.activePlayerProfile.linkedSaveFile ? ` - save: ${escapeHtml(dashboard.activePlayerProfile.linkedSaveFile)}` : ""}`
+        : "Set one on Player Profiles";
+    document.getElementById("metrics").innerHTML = `
+        <div class="metric"><span>Ledger Status</span><strong>${dashboard.databaseStatus}</strong><small>${dashboard.databasePath}</small></div>
+        <div class="metric"><span>Living Cast</span><strong>${dashboard.activeCharacters}</strong><small>${dashboard.inactiveCharacters} archived profiles retained</small></div>
+        <div class="metric"><span>Mod Tomes</span><strong>${dashboard.detectedMods}</strong><small>Active scan sources</small></div>
+        <div class="metric"><span>Conflict Runes</span><strong>${dashboard.conflictsFound}</strong><small>Awaiting review</small></div>
+        <div class="metric"><span>Farmer Profile</span><strong>${dashboard.activePlayerProfile ? escapeHtml(dashboard.activePlayerProfile.profileName) : "None"}</strong><small>${profileDetail}</small></div>`;
     renderDialogueCards("dialogue-cards", dashboard.recentGeneratedDialogue);
     renderDashboardCharts(dashboard);
     renderTable("changes", [
@@ -197,7 +206,7 @@ function renderDialogueCards(id, rows) {
     const container = document.getElementById(id);
     if (!container) return;
     if (!rows || rows.length === 0) {
-        container.innerHTML = `<div class="empty-state"><div class="empty-icon">DL</div><p>No generated dialogue yet. Use Dialogue Test to create the first line.</p></div>`;
+        container.innerHTML = `<div class="empty-state"><div class="empty-icon">DL</div><p>No spoken lines in the ledger yet. Use Dialogue Test to conjure the first one.</p></div>`;
         return;
     }
     container.innerHTML = rows.slice(0, 6).map(row => `
@@ -223,10 +232,10 @@ function renderDashboardCharts(dashboard) {
     if (!container) return;
     const max = Math.max(1, dashboard.activeCharacters, dashboard.inactiveCharacters, dashboard.detectedMods, dashboard.conflictsFound);
     const rows = [
-        ["Active Characters", dashboard.activeCharacters],
-        ["Inactive Characters", dashboard.inactiveCharacters],
-        ["Detected Mods", dashboard.detectedMods],
-        ["Lore Conflicts", dashboard.conflictsFound]
+        ["Living Cast", dashboard.activeCharacters],
+        ["Archived Cast", dashboard.inactiveCharacters],
+        ["Mod Tomes", dashboard.detectedMods],
+        ["Conflict Runes", dashboard.conflictsFound]
     ];
     container.innerHTML = rows.map(([label, value]) => `
         <div class="chart-bar">
@@ -451,35 +460,84 @@ function bindOverrideForm(id) {
 }
 
 async function loadMemories() {
-    const memories = await api("/api/memories");
+    const filter = document.getElementById("memory-filter-form");
+    const params = filter ? new URLSearchParams(formJson(filter)) : new URLSearchParams();
+    if (filter && filter.elements.namedItem("includeInactive").checked)
+        params.set("includeInactive", "true");
+    else
+        params.set("includeInactive", "false");
+    for (const [key, value] of [...params.entries()]) {
+        if (value === "" || value == null)
+            params.delete(key);
+    }
+    const memories = await api(`/api/memories?${params.toString()}`);
     renderTable("memories", [
         { label: "ID", key: "id" },
+        { label: "Save", key: "saveFileName" },
+        { label: "Profile", key: "playerProfileId" },
+        { label: "NPC", key: "npcName" },
+        { label: "Type", key: "memoryType" },
+        { label: "Source", key: "source" },
         { label: "Character ID", key: "characterId" },
         { label: "Importance", key: "importance" },
-        { label: "Memory", key: "memoryText" },
+        { label: "Title", key: "title" },
+        { label: "Memory", key: "summary" },
+        { label: "In-game Date", render: row => `${row.year || 0} ${row.season || ""} ${row.day || 0}`.trim() },
+        { label: "Location", key: "location" },
         { label: "Created", key: "createdDate" },
+        { label: "Active", render: row => row.isActive ? "Yes" : "No" },
         { label: "Action", render: row => {
-            const button = document.createElement("button");
-            button.className = "secondary";
-            button.textContent = "Edit";
-            button.onclick = () => {
+            const wrap = document.createElement("div");
+            wrap.className = "button-row";
+            const edit = document.createElement("button");
+            edit.className = "secondary";
+            edit.textContent = "Edit";
+            edit.onclick = () => {
                 const form = document.getElementById("memory-form");
-                form.elements.namedItem("id").value = row.id;
-                form.elements.namedItem("characterId").value = row.characterId;
-                form.elements.namedItem("importance").value = row.importance;
-                form.elements.namedItem("memoryText").value = row.memoryText;
+                for (const name of ["id", "characterId", "saveFileName", "playerName", "farmName", "playerProfileId", "npcName", "memoryType", "title", "importance", "season", "day", "year", "location", "tags", "summary"]) {
+                    const field = form.elements.namedItem(name);
+                    if (field)
+                        field.value = row[name] ?? "";
+                }
+                form.elements.namedItem("isActive").checked = !!row.isActive;
             };
-            return button;
+            const deactivate = document.createElement("button");
+            deactivate.className = "secondary";
+            deactivate.textContent = "Deactivate";
+            deactivate.onclick = async () => {
+                await api(`/api/memories/${row.id}/deactivate`, { method: "POST" });
+                await loadMemories();
+            };
+            const del = document.createElement("button");
+            del.className = "secondary";
+            del.textContent = "Delete";
+            del.onclick = async () => {
+                await api(`/api/memories/${row.id}`, { method: "DELETE" });
+                await loadMemories();
+            };
+            wrap.append(edit, deactivate, del);
+            return wrap;
         }}
     ], memories);
 }
 
 function bindMemoryForm() {
+    const filter = document.getElementById("memory-filter-form");
+    if (filter) {
+        filter.addEventListener("submit", async event => {
+            event.preventDefault();
+            await loadMemories();
+        });
+    }
+
     document.getElementById("memory-form").addEventListener("submit", async event => {
         event.preventDefault();
         const json = formJson(event.target);
         const id = json.id;
         delete json.id;
+        json.memoryText = json.summary;
+        json.source = json.source || "Manual";
+        json.isActive = event.target.elements.namedItem("isActive").checked;
         await api(id ? `/api/memories/${id}` : "/api/memories", {
             method: id ? "PUT" : "POST",
             body: JSON.stringify(json)

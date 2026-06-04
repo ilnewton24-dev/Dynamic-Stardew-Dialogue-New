@@ -7,6 +7,41 @@ public sealed class DialogueContextSelectionService
 {
     private static readonly Regex WordRegex = new("[A-Za-z][A-Za-z']+", RegexOptions.Compiled);
 
+    // SDV dialogue control code patterns to strip before sending text to the prompt.
+    private static readonly Regex SdvPortraitCode   = new(@"\$\d", RegexOptions.Compiled);
+    private static readonly Regex SdvBreakCode      = new(@"#\$b#|#\$e#", RegexOptions.Compiled);
+    private static readonly Regex SdvFillIn         = new(@"%(adj|noun|place|name|time|band|book|film|jite|rival|pet|farm|favorite)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex ContentPatchToken = new(@"\{\{[^}]*\}\}", RegexOptions.Compiled);
+    private static readonly Regex I18nToken         = new(@"\[i18n\s+[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// Removes Stardew Valley dialogue control codes and Content Patcher tokens from a raw
+    /// dialogue string, leaving only the human-readable text suitable for the prompt.
+    /// Returns an empty string when nothing useful remains.
+    /// </summary>
+    public static string CleanDialogueText(string raw, string playerName = "you")
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+
+        string text = SdvPortraitCode.Replace(raw, "");
+        text = SdvBreakCode.Replace(text, " ");
+        text = SdvFillIn.Replace(text, "...");
+        text = ContentPatchToken.Replace(text, "...");
+        text = I18nToken.Replace(text, "");
+        text = text.Replace("@", playerName);
+
+        // Gender-conditional text: "sentence1^sentence2" → take the first branch.
+        int caret = text.IndexOf('^');
+        if (caret >= 0) text = text[..caret];
+
+        text = text.Trim();
+
+        // Discard lines that are only control codes, too short, or unresolved i18n keys.
+        if (text.Length < 8) return "";
+        if (text.All(c => !char.IsLetter(c))) return "";
+        return text;
+    }
+
     private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "the", "and", "you", "your", "that", "this", "with", "for", "from", "have", "what", "when",
@@ -17,10 +52,29 @@ public sealed class DialogueContextSelectionService
     public IReadOnlyList<DialogueSource> SelectRelevantDialogueSources(
         DialogueContext context,
         DialogueLoreBundle lore,
-        int limit = 10)
+        int limit = 8)
     {
+        if (lore.DialogueSources.Count == 0)
+            return Array.Empty<DialogueSource>();
+
         string relationshipState = NormalizeRelationshipState(lore.SaveContext.RelationshipState, context.FriendshipLevel);
-        return lore.DialogueSources
+        string playerName = string.IsNullOrWhiteSpace(lore.SaveContext.PlayerName) ? "you" : lore.SaveContext.PlayerName;
+
+        // Pre-filter: only include sources whose cleaned text is usable.
+        IReadOnlyList<DialogueSource> usable = lore.DialogueSources
+            .Where(s => !string.IsNullOrWhiteSpace(CleanDialogueText(s.RawText, playerName)))
+            .ToArray();
+
+        System.Diagnostics.Debug.WriteLine(
+            $"[Selection] '{context.CharacterName}': {lore.DialogueSources.Count} total sources, " +
+            $"{usable.Count} usable after text-quality filter.");
+
+        if (usable.Count == 0)
+            return Array.Empty<DialogueSource>();
+
+        // Score all usable sources and take the top ones.
+        // No minimum score threshold — always return something if sources exist.
+        IReadOnlyList<DialogueSource> selected = usable
             .Select(source => new { Source = source, Score = ScoreSource(source, context, lore, relationshipState) })
             .OrderByDescending(item => item.Score)
             .ThenByDescending(item => item.Source.SourcePriority)
@@ -28,12 +82,18 @@ public sealed class DialogueContextSelectionService
             .Take(limit)
             .Select(item => item.Source)
             .ToArray();
+
+        System.Diagnostics.Debug.WriteLine(
+            $"[Selection] '{context.CharacterName}': selected {selected.Count} example(s) (limit={limit}).");
+        return selected;
     }
 
     public CharacterVoiceProfile BuildVoiceProfile(IReadOnlyList<DialogueSource> sources, DialogueSourceSummary? summary)
     {
+        // Use cleaned text for all voice profile metrics so SDV control codes don't
+        // skew word counts or pollute vocabulary.
         string[] lines = sources
-            .Select(source => source.RawText)
+            .Select(source => CleanDialogueText(source.RawText))
             .Where(line => !string.IsNullOrWhiteSpace(line))
             .Take(80)
             .ToArray();

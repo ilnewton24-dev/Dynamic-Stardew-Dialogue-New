@@ -24,6 +24,9 @@ public sealed class ModConfig
     public bool UseLocalWebApiForDialogue { get; set; } = true;
     public string LocalWebApiBaseUrl { get; set; } = "http://localhost:5077";
     public bool DebugLogging { get; set; } = true;
+    public string PlaceholderText { get; set; } = "...";
+    public int PlaceholderDelayMs { get; set; } = 300;
+    public int MaxGenerationWaitMs { get; set; } = 8000;
 
     // Local dashboard auto-start (personal drop-in install).
     public bool EnableLocalDashboardAutoStart { get; set; } = true;

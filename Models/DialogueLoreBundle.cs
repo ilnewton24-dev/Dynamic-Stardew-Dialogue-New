@@ -5,7 +5,15 @@ public sealed class DialogueLoreBundle
     public Character Character { get; init; } = new();
     public CanonicalCharacter? CanonicalCharacter { get; init; }
     public IReadOnlyList<Character> CharacterInstances { get; init; } = Array.Empty<Character>();
+    /// <summary>Active character sources only — used in the prompt and voice-profile derivation.</summary>
     public IReadOnlyList<CharacterSource> CharacterSources { get; init; } = Array.Empty<CharacterSource>();
+
+    /// <summary>
+    /// All character sources including inactive historical ones — used in the explainability trace
+    /// so the explanation page can show which sources were present but excluded from generation.
+    /// Never used for prompt building.
+    /// </summary>
+    public IReadOnlyList<CharacterSource> CharacterSourcesAll { get; init; } = Array.Empty<CharacterSource>();
     public IReadOnlyList<DialogueSource> DialogueSources { get; init; } = Array.Empty<DialogueSource>();
     public IReadOnlyList<DialogueSource> RelevantDialogueSources { get; init; } = Array.Empty<DialogueSource>();
     public DialogueSourceSummary? DialogueSummary { get; init; }

@@ -22,6 +22,8 @@ public sealed class ModEntry : Mod
     private LocalDialogueApiClient? localDialogueApiClient;
     private DashboardProcessService? dashboardProcess;
     private CharacterRepository? characterRepository;
+    private MemoryRepository? memoryRepository;
+    private PlayerProfileRepository? playerProfileRepository;
 
     // Names that are locations/buildings/objects, never valid dialogue characters.
     private static readonly HashSet<string> BlockedSpeakerNames = new(StringComparer.OrdinalIgnoreCase)
@@ -50,11 +52,27 @@ public sealed class ModEntry : Mod
     // prefix must decide eligibility synchronously, so it cannot query the database directly.
     private volatile HashSet<string> activeCharacterNames = new(StringComparer.OrdinalIgnoreCase);
 
+    // Known vanilla villagers whose dialogue can be loaded at save-load time via SMAPI content API.
+    // These are registered with the server as StardewValley.Vanilla sources so the prompt builder
+    // always has canonical examples even when no Content Patcher dialogue mods are installed.
+    private static readonly string[] VanillaVillagerNames =
+    {
+        "Abigail", "Alex", "Caroline", "Clint", "Demetrius", "Elliott", "Emily",
+        "Evelyn", "George", "Gus", "Haley", "Harvey", "Jas", "Jodi", "Kent",
+        "Leah", "Leo", "Lewis", "Linus", "Marnie", "Maru", "Pam", "Penny",
+        "Pierre", "Robin", "Sam", "Sandy", "Sebastian", "Shane", "Vincent",
+        "Willy", "Wizard", "Krobus", "Dwarf", "Gunther"
+    };
+
     // Pending Harmony generation tracking: a newer request supersedes an older one for the same NPC.
     private long dialogueRequestCounter;
     private long pendingRequestId;
 
-    private const string HarmonyPlaceholderText = "...";
+    private readonly Dictionary<string, string> observedFriendshipMilestones = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> observedRelationshipMilestones = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> observedEventIds = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> observedCompletedQuestIds = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> observedCommunityMilestones = new(StringComparer.OrdinalIgnoreCase);
 
     public override void Entry(IModHelper helper)
     {
@@ -70,6 +88,8 @@ public sealed class ModEntry : Mod
         this.Monitor.Log($"  Server URL = {this.config.LocalWebApiBaseUrl}", LogLevel.Info);
         this.Monitor.Log($"  UseHarmonyDialogueInterception = {this.config.UseHarmonyDialogueInterception}", LogLevel.Info);
         this.Monitor.Log($"  DebugLogging = {this.config.DebugLogging}", LogLevel.Info);
+        this.Monitor.Log($"  PlaceholderDelayMs = {this.config.PlaceholderDelayMs}", LogLevel.Info);
+        this.Monitor.Log($"  MaxGenerationWaitMs = {this.config.MaxGenerationWaitMs}", LogLevel.Info);
 
         // ---- Harmony patch (intercept NPC dialogue before vanilla opens) --------------------
         if (this.config.UseHarmonyDialogueInterception)
@@ -121,6 +141,7 @@ public sealed class ModEntry : Mod
             RelationshipRepository relationshipRepository = new(connectionFactory);
             EventRepository eventRepository = new(connectionFactory);
             MemoryRepository memoryRepository = new(connectionFactory);
+            this.memoryRepository = memoryRepository;
             VoiceRuleRepository voiceRuleRepository = new(connectionFactory);
             CharacterHistoryRepository characterHistoryRepository = new(connectionFactory);
             LoreChangeLogRepository loreChangeLogRepository = new(connectionFactory);
@@ -131,6 +152,7 @@ public sealed class ModEntry : Mod
             CharacterValidationRepository characterValidationRepository = new(connectionFactory);
             CanonicalCharacterRepository canonicalCharacterRepository = new(connectionFactory);
             DialogueSourceRepository dialogueSourceRepository = new(connectionFactory);
+            this.playerProfileRepository = new PlayerProfileRepository(connectionFactory);
 
             if (this.config.EnableDynamicModScanning)
             {
@@ -290,6 +312,58 @@ public sealed class ModEntry : Mod
         string saveFile = SafeGet(() => Constants.SaveFolderName ?? string.Empty, "(unknown)");
         this.Monitor.Log($"[Event] SaveLoaded. Player='{playerName}', farm='{farmName}', saveFile='{saveFile}', location='{Game1.currentLocation?.NameOrUniqueName}'. Living Lore interaction detection is active.", LogLevel.Info);
         _ = Task.Run(this.RefreshActiveCharacterCacheAsync); // ensure the eligibility cache reflects the loaded save
+        this.ResetAutomaticMemoryBaselines(saveFile);
+
+        // Extract vanilla dialogue via SMAPI content API (synchronous on game thread) and register
+        // with the server in the background so the prompt builder has canonical examples even when
+        // no Content Patcher dialogue mods are installed.
+        if (this.localDialogueApiClient is not null)
+            this.RegisterVanillaDialogue();
+    }
+
+    /// <summary>
+    /// Loads vanilla character dialogue from the game's content via SMAPI's content pipeline
+    /// (must be called on the game thread), then fires off async HTTP registration to the server.
+    /// Sources are stored as StardewValley.Vanilla and are never deactivated by the mod scanner.
+    /// </summary>
+    private void RegisterVanillaDialogue()
+    {
+        if (this.localDialogueApiClient is null)
+            return;
+
+        Dictionary<string, Dictionary<string, string>> extracted = new(StringComparer.OrdinalIgnoreCase);
+        foreach (string name in VanillaVillagerNames)
+        {
+            try
+            {
+                Dictionary<string, string>? dialogue = this.Helper.GameContent
+                    .Load<Dictionary<string, string>>($"Characters/Dialogue/{name}");
+                if (dialogue?.Count > 0)
+                    extracted[name] = dialogue;
+            }
+            catch
+            {
+                // Some characters (e.g. Dwarf before progression) have no dialogue file; skip silently.
+            }
+        }
+
+        if (extracted.Count == 0)
+        {
+            this.Monitor.Log("[VanillaDialogue] No vanilla dialogue found to register; skipping.", LogLevel.Trace);
+            return;
+        }
+
+        int totalLines = extracted.Values.Sum(d => d.Count);
+        this.Monitor.Log($"[VanillaDialogue] Loaded {totalLines} line(s) for {extracted.Count} vanilla character(s); posting to server in background.", LogLevel.Info);
+
+        LocalDialogueApiClient client = this.localDialogueApiClient;
+        _ = Task.Run(async () =>
+        {
+            foreach (KeyValuePair<string, Dictionary<string, string>> pair in extracted)
+            {
+                await client.RegisterVanillaDialogueAsync(pair.Key, pair.Value);
+            }
+        });
     }
 
     private void OnWarped(object? sender, WarpedEventArgs e)
@@ -313,6 +387,365 @@ public sealed class ModEntry : Mod
             this.suppressionWindowActive = false;
             this.Monitor.Log("[Input suppression] Ended; action buttons re-enabled for dialogue.", LogLevel.Info);
         }
+
+        if (e.IsMultipleOf(60))
+            this.CaptureAutomaticMemories();
+    }
+
+    private void ResetAutomaticMemoryBaselines(string saveFileName)
+    {
+        this.observedFriendshipMilestones.Clear();
+        this.observedRelationshipMilestones.Clear();
+        this.observedEventIds = ReadSeenEventIds();
+        this.observedCompletedQuestIds = ReadCompletedQuestIds();
+        this.observedCommunityMilestones = ReadCommunityMilestones();
+
+        foreach (string npcName in this.GetMemoryCandidateNpcNames())
+        {
+            FriendshipSnapshot snapshot = this.GetFriendshipSnapshot(npcName);
+            this.observedFriendshipMilestones[npcName] = snapshot.FriendshipMilestone;
+            this.observedRelationshipMilestones[npcName] = snapshot.RelationshipMilestone;
+        }
+
+        this.Monitor.Log(
+            $"[MemoryCapture] SaveLoaded baseline recorded for saveFile='{saveFileName}'. " +
+            $"events={this.observedEventIds.Count}, quests={this.observedCompletedQuestIds.Count}, community={this.observedCommunityMilestones.Count}. " +
+            "No automatic memory created on load.",
+            LogLevel.Info);
+    }
+
+    private void CaptureAutomaticMemories()
+    {
+        if (!Context.IsWorldReady || Game1.player is null || this.memoryRepository is null)
+            return;
+
+        SaveFileContextSnapshot save = this.BuildSaveContextSnapshot(null);
+        if (string.IsNullOrWhiteSpace(save.SaveFileName))
+        {
+            this.Monitor.Log("[MemoryCapture] Automatic memory skipped: SaveFileName is missing.", LogLevel.Warn);
+            return;
+        }
+
+        this.CaptureFriendshipMemories(save);
+        this.CaptureEventMemories(save);
+        this.CaptureQuestMemories(save);
+        this.CaptureCommunityMemories(save);
+    }
+
+    private void CaptureFriendshipMemories(SaveFileContextSnapshot save)
+    {
+        foreach (string npcName in this.GetMemoryCandidateNpcNames())
+        {
+            FriendshipSnapshot snapshot = this.GetFriendshipSnapshot(npcName);
+            string previousFriendship = this.observedFriendshipMilestones.GetValueOrDefault(npcName, "unmet");
+            string previousRelationship = this.observedRelationshipMilestones.GetValueOrDefault(npcName, "none");
+
+            if (!snapshot.FriendshipMilestone.Equals(previousFriendship, StringComparison.OrdinalIgnoreCase)
+                && FriendshipMilestoneRank(snapshot.FriendshipMilestone) > FriendshipMilestoneRank(previousFriendship))
+            {
+                this.observedFriendshipMilestones[npcName] = snapshot.FriendshipMilestone;
+                string title = snapshot.FriendshipMilestone.Equals("met", StringComparison.OrdinalIgnoreCase)
+                    ? $"Met {npcName}"
+                    : $"{npcName} reached {snapshot.FriendshipMilestone} hearts";
+                string summary = snapshot.FriendshipMilestone.Equals("met", StringComparison.OrdinalIgnoreCase)
+                    ? $"{save.PlayerName} met {npcName} in this save."
+                    : $"{save.PlayerName} and {npcName} reached {snapshot.FriendshipMilestone} hearts in this save.";
+                this.QueueAutomaticMemory(save, npcName, "FriendshipThreshold", $"friendship:{npcName}:{snapshot.FriendshipMilestone}", title, summary, 4, "friendship,automatic");
+            }
+
+            if (!snapshot.RelationshipMilestone.Equals(previousRelationship, StringComparison.OrdinalIgnoreCase))
+            {
+                this.observedRelationshipMilestones[npcName] = snapshot.RelationshipMilestone;
+                if (snapshot.RelationshipMilestone is "dating" or "marriage")
+                {
+                    string title = snapshot.RelationshipMilestone == "dating"
+                        ? $"{save.PlayerName} started dating {npcName}"
+                        : $"{save.PlayerName} married {npcName}";
+                    string summary = snapshot.RelationshipMilestone == "dating"
+                        ? $"{save.PlayerName} and {npcName} are dating in this save."
+                        : $"{save.PlayerName} and {npcName} are married in this save.";
+                    this.QueueAutomaticMemory(save, npcName, "RelationshipStatus", $"relationship:{npcName}:{snapshot.RelationshipMilestone}", title, summary, 5, "relationship,automatic");
+                }
+            }
+        }
+    }
+
+    private void CaptureEventMemories(SaveFileContextSnapshot save)
+    {
+        HashSet<string> current = ReadSeenEventIds();
+        foreach (string eventId in current.Except(this.observedEventIds, StringComparer.OrdinalIgnoreCase).Take(10))
+        {
+            this.observedEventIds.Add(eventId);
+            this.QueueAutomaticMemory(
+                save,
+                npcName: null,
+                memoryType: "EventSeen",
+                referenceId: $"event:{eventId}",
+                title: $"Event seen: {eventId}",
+                summary: $"{save.PlayerName} saw event {eventId} in this save.",
+                importance: 3,
+                tags: $"event,{eventId},automatic");
+        }
+    }
+
+    private void CaptureQuestMemories(SaveFileContextSnapshot save)
+    {
+        HashSet<string> current = ReadCompletedQuestIds();
+        foreach (string questId in current.Except(this.observedCompletedQuestIds, StringComparer.OrdinalIgnoreCase).Take(10))
+        {
+            this.observedCompletedQuestIds.Add(questId);
+            this.QueueAutomaticMemory(
+                save,
+                npcName: null,
+                memoryType: "QuestCompleted",
+                referenceId: $"quest:{questId}",
+                title: $"Quest completed: {questId}",
+                summary: $"{save.PlayerName} completed quest {questId} in this save.",
+                importance: 3,
+                tags: $"quest,{questId},automatic");
+        }
+    }
+
+    private void CaptureCommunityMemories(SaveFileContextSnapshot save)
+    {
+        HashSet<string> current = ReadCommunityMilestones();
+        foreach (string milestone in current.Except(this.observedCommunityMilestones, StringComparer.OrdinalIgnoreCase))
+        {
+            this.observedCommunityMilestones.Add(milestone);
+            this.QueueAutomaticMemory(
+                save,
+                npcName: null,
+                memoryType: "CommunityProgression",
+                referenceId: $"community:{milestone}",
+                title: $"Community milestone: {milestone}",
+                summary: $"{save.PlayerName} reached community milestone {milestone} in this save.",
+                importance: milestone.Contains("Complete", StringComparison.OrdinalIgnoreCase) ? 5 : 4,
+                tags: $"community,{milestone},automatic");
+        }
+    }
+
+    private void QueueAutomaticMemory(
+        SaveFileContextSnapshot save,
+        string? npcName,
+        string memoryType,
+        string referenceId,
+        string title,
+        string summary,
+        int importance,
+        string tags)
+    {
+        if (this.memoryRepository is null || string.IsNullOrWhiteSpace(save.SaveFileName))
+        {
+            this.Monitor.Log("[MemoryCapture] Automatic memory skipped: missing repository or save file name.", LogLevel.Warn);
+            return;
+        }
+
+        this.Monitor.Log($"[MemoryCapture] memory trigger detected. saveFile='{save.SaveFileName}', npc='{npcName ?? "(none)"}', type='{memoryType}', reference='{referenceId}'.", LogLevel.Info);
+
+        MemoryRepository repo = this.memoryRepository;
+        CharacterRepository? characters = this.characterRepository;
+        PlayerProfileRepository? profiles = this.playerProfileRepository;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                long? characterId = null;
+                if (!string.IsNullOrWhiteSpace(npcName) && characters is not null)
+                    characterId = (await characters.GetByNameAsync(npcName))?.Id;
+
+                long? playerProfileId = profiles is null ? null : (await ResolvePlayerProfileForMemoryAsync(profiles, save))?.Id;
+                LivingLoreDialogue.Models.Memory memory = new()
+                {
+                    CharacterId = characterId,
+                    SaveFileName = save.SaveFileName,
+                    SaveFilePath = save.SaveFilePath,
+                    PlayerName = save.PlayerName,
+                    FarmName = save.FarmName,
+                    PlayerProfileId = playerProfileId,
+                    NpcName = string.IsNullOrWhiteSpace(npcName) ? null : npcName,
+                    MemoryType = memoryType,
+                    Title = title,
+                    Summary = summary,
+                    MemoryText = summary,
+                    Importance = importance,
+                    Season = save.Season,
+                    Day = save.Day,
+                    Year = save.Year,
+                    Location = save.Location,
+                    Source = "Automatic",
+                    IsActive = true,
+                    Tags = tags,
+                    ReferenceId = referenceId
+                };
+
+                AutomaticMemoryWriteResult result = await repo.UpsertAutomaticAsync(memory);
+                if (result.Inserted)
+                    this.Monitor.Log($"[MemoryCapture] memory inserted. saveFile='{save.SaveFileName}', npc='{npcName ?? "(none)"}', id={result.Id}.", LogLevel.Info);
+                else if (result.DuplicateSkipped)
+                    this.Monitor.Log($"[MemoryCapture] duplicate memory skipped. saveFile='{save.SaveFileName}', npc='{npcName ?? "(none)"}', id={result.Id}.", LogLevel.Info);
+                else
+                    this.Monitor.Log($"[MemoryCapture] memory skipped. saveFile='{save.SaveFileName}', npc='{npcName ?? "(none)"}', reason='{result.Message}'.", LogLevel.Warn);
+            }
+            catch (Exception ex)
+            {
+                this.Monitor.Log($"[MemoryCapture] Error writing automatic memory: {ex.Message}", LogLevel.Warn);
+            }
+        });
+    }
+
+    private IEnumerable<string> GetMemoryCandidateNpcNames()
+    {
+        return this.activeCharacterNames
+            .Concat(VanillaVillagerNames)
+            .Where(name => !string.IsNullOrWhiteSpace(name) && !BlockedSpeakerNames.Contains(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private FriendshipSnapshot GetFriendshipSnapshot(string npcName)
+    {
+        int hearts = 0;
+        bool hasMet = false;
+        bool dating = false;
+        bool married = false;
+
+        try
+        {
+            if (Game1.player.friendshipData.TryGetValue(npcName, out Friendship? friendship) && friendship is not null)
+            {
+                hearts = Math.Clamp(friendship.Points / 250, 0, 14);
+                hasMet = friendship.Points > 0 || friendship.TalkedToToday;
+                dating = friendship.Status == FriendshipStatus.Dating;
+                married = friendship.Status == FriendshipStatus.Married;
+            }
+
+            married = married || string.Equals(Game1.player.spouse, npcName, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            // A missing friendship row is normal for unknown/inactive characters.
+        }
+
+        return new FriendshipSnapshot(
+            FriendshipMilestoneFor(hearts, hasMet),
+            married ? "marriage" : dating ? "dating" : "none");
+    }
+
+    private static string FriendshipMilestoneFor(int hearts, bool hasMet)
+    {
+        if (hearts >= 10)
+            return "10";
+        if (hearts >= 8)
+            return "8";
+        if (hearts >= 6)
+            return "6";
+        if (hearts >= 4)
+            return "4";
+        if (hearts >= 2)
+            return "2";
+        return hasMet ? "met" : "unmet";
+    }
+
+    private static int FriendshipMilestoneRank(string milestone)
+    {
+        return milestone.ToLowerInvariant() switch
+        {
+            "met" => 1,
+            "2" => 2,
+            "4" => 3,
+            "6" => 4,
+            "8" => 5,
+            "10" => 6,
+            _ => 0
+        };
+    }
+
+    private static HashSet<string> ReadSeenEventIds()
+    {
+        return ReadStringSet(() => Game1.player.eventsSeen.Select(id => id.ToString()));
+    }
+
+    private static HashSet<string> ReadCompletedQuestIds()
+    {
+        HashSet<string> ids = new(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            object? player = Game1.player;
+            foreach (string memberName in new[] { "completedQuestIds", "completedQuests" })
+            {
+                object? value = player?.GetType().GetProperty(memberName)?.GetValue(player)
+                    ?? player?.GetType().GetField(memberName)?.GetValue(player);
+                if (value is System.Collections.IEnumerable enumerable and not string)
+                {
+                    foreach (object? item in enumerable)
+                    {
+                        if (!string.IsNullOrWhiteSpace(item?.ToString()))
+                            ids.Add(item.ToString()!);
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Quest APIs have varied across SDV versions; failing closed avoids noisy memories.
+        }
+
+        return ids;
+    }
+
+    private static HashSet<string> ReadCommunityMilestones()
+    {
+        HashSet<string> milestones = new(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (Game1.MasterPlayer.mailReceived.Contains("JojaMember"))
+                milestones.Add("JojaMember");
+            if (Game1.MasterPlayer.mailReceived.Contains("cc_Complete"))
+                milestones.Add("CommunityCenterComplete");
+            if (Game1.MasterPlayer.mailReceived.Contains("joja_Begin"))
+                milestones.Add("JojaRouteStarted");
+            if (Game1.MasterPlayer.mailReceived.Contains("joja_Complete"))
+                milestones.Add("JojaRouteComplete");
+            if (Game1.MasterPlayer.mailReceived.Contains("Minecart"))
+                milestones.Add("MinecartsUnlocked");
+            if (Game1.MasterPlayer.mailReceived.Contains("ccVault"))
+                milestones.Add("BusUnlocked");
+        }
+        catch
+        {
+            // Mail flags are best-effort progression hints.
+        }
+
+        return milestones;
+    }
+
+    private static HashSet<string> ReadStringSet(Func<IEnumerable<string>> getter)
+    {
+        try
+        {
+            return getter()
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private static async Task<PlayerProfile?> ResolvePlayerProfileForMemoryAsync(PlayerProfileRepository profiles, SaveFileContextSnapshot save)
+    {
+        if (!string.IsNullOrWhiteSpace(save.SaveFileName))
+        {
+            PlayerProfile? linked = await profiles.GetBySaveFileAsync(save.SaveFileName);
+            if (linked is not null)
+                return linked;
+        }
+
+        PlayerProfile? matched = await profiles.GetByFarmerAndFarmAsync(save.PlayerName, save.FarmName);
+        if (matched is not null)
+            return matched;
+
+        return await profiles.GetActiveAsync();
     }
 
     // ===================== Interaction detection (button press) =============================
@@ -495,12 +928,10 @@ public sealed class ModEntry : Mod
         // Eligible: intercept before vanilla opens any dialogue.
         long requestId = ++this.dialogueRequestCounter;
         this.pendingRequestId = requestId;
-        this.Monitor.Log($"[Harmony] INTERCEPTING checkAction for '{npc.Name}' (request #{requestId}). Showing placeholder, generating asynchronously.", LogLevel.Info);
+        this.Monitor.Log($"[Harmony] INTERCEPTING checkAction for '{npc.Name}' (request #{requestId}). Starting generation with delayed placeholder.", LogLevel.Info);
 
         result = true; // tell the game the action was handled
 
-        // Show the placeholder immediately using the compile-safe NPC dialogue method.
-        this.DisplayGeneratedDialogue(npc, HarmonyPlaceholderText, replaceOpenBox: false);
         this.RequestGeneratedForHarmony(npc, requestId);
 
         return false; // task 4: skip vanilla NPC.checkAction
@@ -511,18 +942,86 @@ public sealed class ModEntry : Mod
         string speakerName = npc.Name;
         DialogueContext context = this.BuildContext(npc, "general", "SMAPI-Harmony");
         this.LogIdentityContext(context, speakerName);
+
+        // Log the live save identity fields being sent to the server for profile resolution.
+        if (context.SaveContext is SaveFileContextSnapshot scs)
+        {
+            this.Monitor.Log(
+                $"[SMAPI] Sending to server: requestSource={context.RequestSource}, " +
+                $"saveFileName={scs.SaveFileName ?? "(none)"}, playerName={scs.PlayerName}, farmName={scs.FarmName}. " +
+                $"activePlayerProfileId=(none — server will auto-resolve).",
+                LogLevel.Info);
+        }
+        else
+        {
+            this.Monitor.Log("[SMAPI] No save context built; server will use fallback defaults.", LogLevel.Warn);
+        }
+        int placeholderDelayMs = Math.Max(0, this.config.PlaceholderDelayMs);
+        int maxGenerationWaitMs = Math.Max(1000, this.config.MaxGenerationWaitMs);
+        string placeholderText = string.IsNullOrWhiteSpace(this.config.PlaceholderText) ? "..." : this.config.PlaceholderText;
+        DateTime startedAt = DateTime.UtcNow;
+        object stateLock = new();
+        bool placeholderShown = false;
+        bool placeholderConsidered = false;
+        this.Monitor.Log($"[Harmony] Generation started for '{speakerName}' (request #{requestId}, placeholderDelayMs={placeholderDelayMs}, maxWaitMs={maxGenerationWaitMs}).", LogLevel.Info);
+
         _ = Task.Run(async () =>
         {
-            GeneratedDialogueResult? result = await this.GenerateResultAsync(context, "SMAPI-Harmony");
+            Task<GeneratedDialogueResult?> generationTask = this.GenerateResultAsync(context, "SMAPI-Harmony");
+            _ = Task.Run(async () =>
+            {
+                if (placeholderDelayMs > 0)
+                    await Task.Delay(placeholderDelayMs);
+
+                if (generationTask.IsCompleted)
+                {
+                    lock (stateLock)
+                        placeholderConsidered = true;
+                    return;
+                }
+
+                this.mainThreadActions.Enqueue(() =>
+                {
+                    if (!Context.IsWorldReady || requestId != this.pendingRequestId || Game1.activeClickableMenu is not null)
+                    {
+                        lock (stateLock)
+                            placeholderConsidered = true;
+                        this.Monitor.Log($"[Harmony] Placeholder skipped for '{speakerName}' (request #{requestId}); request no longer displayable.", LogLevel.Info);
+                        return;
+                    }
+
+                    this.DisplayGeneratedDialogue(npc, placeholderText, replaceOpenBox: false);
+                    lock (stateLock)
+                    {
+                        placeholderShown = true;
+                        placeholderConsidered = true;
+                    }
+                    this.Monitor.Log($"[Harmony] Placeholder shown for '{speakerName}' (request #{requestId}) after {(DateTime.UtcNow - startedAt).TotalMilliseconds:0}ms.", LogLevel.Info);
+                });
+            });
+
+            Task completed = await Task.WhenAny(generationTask, Task.Delay(maxGenerationWaitMs));
+            GeneratedDialogueResult? result = null;
+            if (completed == generationTask)
+                result = await generationTask;
+            else
+                this.Monitor.Log($"[Harmony] Generation timed out for '{speakerName}' (request #{requestId}) after {maxGenerationWaitMs}ms.", LogLevel.Warn);
+
+            double firstResponseMs = (DateTime.UtcNow - startedAt).TotalMilliseconds;
             this.LogResolvedIdentity(result, context);
             string text = ExtractText(result);
             bool usable = result is not null && string.IsNullOrWhiteSpace(result.Error) && !string.IsNullOrWhiteSpace(text);
-            this.Monitor.Log($"[Harmony] Generation returned for '{speakerName}' (request #{requestId}, usable={usable}); applying on next update tick.", LogLevel.Info);
+            bool showedPlaceholder;
+            bool consideredPlaceholder;
+            lock (stateLock)
+            {
+                showedPlaceholder = placeholderShown;
+                consideredPlaceholder = placeholderConsidered;
+            }
+            this.Monitor.Log($"[Harmony] Generation returned for '{speakerName}' (request #{requestId}, usable={usable}, placeholderShown={showedPlaceholder}, placeholderConsidered={consideredPlaceholder}, firstResponseMs={firstResponseMs:0}); applying on next update tick.", LogLevel.Info);
 
             this.mainThreadActions.Enqueue(() =>
             {
-                // Task 7: verify we are still in-game, no newer request superseded this one, and the
-                // same speaker's dialogue box is still open.
                 if (!Context.IsWorldReady)
                 {
                     this.Monitor.Log($"[Harmony] DISCARDED '{speakerName}' (#{requestId}): no longer in-game.", LogLevel.Info);
@@ -533,23 +1032,33 @@ public sealed class ModEntry : Mod
                     this.Monitor.Log($"[Harmony] DISCARDED '{speakerName}' (#{requestId}): superseded by a newer request (#{this.pendingRequestId}).", LogLevel.Info);
                     return;
                 }
+
+                lock (stateLock)
+                    showedPlaceholder = placeholderShown;
                 bool boxOpen = Game1.activeClickableMenu is DialogueBox;
                 NPC? current = Game1.currentSpeaker;
-                if (!boxOpen || (current is not null && !string.Equals(current.Name, speakerName, StringComparison.OrdinalIgnoreCase)))
+                if (showedPlaceholder && (!boxOpen || (current is not null && !string.Equals(current.Name, speakerName, StringComparison.OrdinalIgnoreCase))))
                 {
                     this.Monitor.Log($"[Harmony] DISCARDED '{speakerName}' (#{requestId}): dialogue closed or speaker changed (boxOpen={boxOpen}, current='{current?.Name ?? "none"}').", LogLevel.Info);
+                    return;
+                }
+                if (!showedPlaceholder && Game1.activeClickableMenu is not null)
+                {
+                    this.Monitor.Log($"[Harmony] DISCARDED '{speakerName}' (#{requestId}): another menu opened before generated dialogue arrived.", LogLevel.Info);
                     return;
                 }
 
                 if (!usable)
                 {
-                    this.Monitor.Log($"[Harmony] Generation failed/empty for '{speakerName}'; closing placeholder and leaving generated dialogue blank. Error='{result?.Error}'.", LogLevel.Warn);
-                    if (Game1.activeClickableMenu is DialogueBox)
+                    this.Monitor.Log($"[Harmony] Generation failed/empty for '{speakerName}' (placeholderShown={showedPlaceholder}); leaving generated dialogue blank. Error='{result?.Error}'.", LogLevel.Warn);
+                    if (showedPlaceholder && Game1.activeClickableMenu is DialogueBox)
                         Game1.exitActiveMenu();
                     return;
                 }
 
-                this.DisplayGeneratedDialogue(npc, text, replaceOpenBox: true);
+                this.DisplayGeneratedDialogue(npc, text, replaceOpenBox: showedPlaceholder);
+                double totalMs = (DateTime.UtcNow - startedAt).TotalMilliseconds;
+                this.Monitor.Log($"[Harmony] Dialogue displayed for '{speakerName}' (request #{requestId}); placeholderShown={showedPlaceholder}, timeToFirstResponseMs={firstResponseMs:0}, totalGenerationDurationMs={totalMs:0}.", LogLevel.Info);
             });
         });
     }
@@ -1094,6 +1603,8 @@ public sealed class ModEntry : Mod
         return gameDirectory?.FullName ?? modsFolderPath;
     }
 }
+
+internal sealed record FriendshipSnapshot(string FriendshipMilestone, string RelationshipMilestone);
 
 /// <summary>
 /// Harmony prefix on <see cref="NPC.checkAction"/>. Lets the mod intercept eligible NPC dialogue

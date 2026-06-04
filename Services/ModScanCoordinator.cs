@@ -126,9 +126,13 @@ public sealed class ModScanCoordinator
                 phaseTimer.Restart();
                 this.Report(progress, "Dialogue source scan", "Dialogue source scan started.", TimeSpan.Zero);
                 DialogueSourceScanSummary dialogueScan = await this.dialogueSourceScanner.ScanAsync(modsFolderPath);
-                errors.AddRange(dialogueScan.Errors.Take(20).Select(error => $"Dialogue source warning: {error}"));
-                this.Report(progress, "Dialogue source scan", "Dialogue source scan completed.", phaseTimer.Elapsed, dialogueScan.FilesInspected, 0, dialogueScan.FilesRead, dialogueScan.Errors.Count, dialogueScan.Errors.Count);
-                this.log?.Invoke($"Dialogue source scan: {dialogueScan.SourcesFound} lines from {dialogueScan.FilesRead} files.");
+                errors.AddRange(dialogueScan.Warnings.Take(20).Select(warning => $"Dialogue source warning: {warning}"));
+                errors.AddRange(dialogueScan.Errors.Take(20).Select(error => $"Dialogue source error: {error}"));
+                this.Report(progress, "Dialogue source scan", "Dialogue source scan completed.", phaseTimer.Elapsed, dialogueScan.FilesInspected, 0, dialogueScan.FilesRead, dialogueScan.Warnings.Count, dialogueScan.Errors.Count);
+                this.log?.Invoke(
+                    $"Dialogue source scan: {dialogueScan.SourcesFound} lines found from {dialogueScan.FilesRead} files in '{modsFolderPath}'; " +
+                    $"{dialogueScan.SourcesDeactivated} stale source(s) from inactive/removed mods deactivated; " +
+                    $"warnings={dialogueScan.Warnings.Count}, errors={dialogueScan.Errors.Count}.");
             }
             ModScanSummary summary = new()
             {

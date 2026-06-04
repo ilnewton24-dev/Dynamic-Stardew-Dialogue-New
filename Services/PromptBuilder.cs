@@ -134,8 +134,11 @@ public sealed class PromptBuilder
         builder.AppendLine($"- Recurring vocabulary: {string.Join(", ", lore.VoiceProfile.RecurringVocabulary.DefaultIfEmpty("None detected"))}");
         builder.AppendLine();
 
-        AppendSection(builder, "Relevant dialogue examples selected for this scene", lore.RelevantDialogueSources.Select(source =>
-            $"{source.DialogueKey} [{source.SourceModId ?? "vanilla/custom"}, {source.Conditions ?? "no conditions"}]: {source.RawText}"));
+        string playerNameForClean = string.IsNullOrWhiteSpace(lore.SaveContext.PlayerName) ? "you" : lore.SaveContext.PlayerName;
+        AppendSection(builder, "Relevant dialogue examples selected for this scene", lore.RelevantDialogueSources
+            .Select(source => (Key: source.DialogueKey, Mod: source.SourceModId ?? "vanilla", Cleaned: DialogueContextSelectionService.CleanDialogueText(source.RawText, playerNameForClean)))
+            .Where(item => !string.IsNullOrWhiteSpace(item.Cleaned))
+            .Select(item => $"{item.Key} [{item.Mod}]: {item.Cleaned}"));
         AppendSection(builder, "User lore overrides", lore.UserOverrides.Select(userOverride =>
             $"{userOverride.OverrideType}.{userOverride.FieldName}: {userOverride.OverrideValue}"));
         AppendSection(builder, "Voice rules", lore.VoiceRules.Select(rule => rule.RuleText));
@@ -143,8 +146,8 @@ public sealed class PromptBuilder
             $"Character ids {relationship.CharacterA} and {relationship.CharacterB}: {relationship.RelationshipType}, strength {relationship.Strength}/100"));
         AppendSection(builder, "Recent events", lore.Events.Select(loreEvent =>
             $"{loreEvent.Title} ({loreEvent.DateOccurred}): {loreEvent.Description}"));
-        AppendSection(builder, "Relevant memories", lore.Memories.Select(memory =>
-            $"Importance {memory.Importance}/5, {memory.CreatedDate:g}: {memory.MemoryText}"));
+        AppendSection(builder, "Save-scoped relevant memories", lore.Memories.Select(memory =>
+            $"Importance {memory.Importance}/5, save {memory.SaveFileName ?? "unknown"}, {FormatMemoryDate(memory)}: {memory.Title} - {memory.Summary}"));
         AppendSection(builder, "Recent lore changes", lore.RecentChanges.Select(change =>
             $"{change.Timestamp:g}: {change.FieldChanged} changed from '{change.OldValue ?? "null"}' to '{change.NewValue ?? "null"}'"));
         AppendSection(builder, "Recently generated dialogue to avoid repeating", lore.RecentGeneratedDialogue.Take(12).Select(line =>
@@ -249,6 +252,15 @@ public sealed class PromptBuilder
             "spouse" => "Settled and natural — a partner checking in, sharing a passing thought, or just being easy together. Domestic and quiet.",
             _ => "Let the relationship and friendship level shape how warm, familiar, or guarded the character sounds."
         };
+    }
+
+    private static string FormatMemoryDate(Memory memory)
+    {
+        string inGameDate = memory.Year > 0 && memory.Day > 0
+            ? $"Year {memory.Year}, {memory.Season} {memory.Day}"
+            : "date unknown";
+        string npc = string.IsNullOrWhiteSpace(memory.NpcName) ? "" : $", NPC {memory.NpcName}";
+        return $"{inGameDate}{npc}, source {memory.Source}";
     }
 
     private static string RelationshipTier(string? relationshipState, int friendshipLevel)

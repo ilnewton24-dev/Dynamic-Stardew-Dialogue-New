@@ -1,11 +1,31 @@
 @page
 <section>
     <h2>Memories</h2>
+    <form id="memory-filter-form" class="toolbar-form">
+        <input name="saveFileName" placeholder="Save file">
+        <input name="playerProfileId" type="number" min="1" placeholder="Profile ID">
+        <input name="npcName" placeholder="NPC">
+        <label><input name="includeInactive" type="checkbox" checked> Include inactive</label>
+        <button type="submit">Filter</button>
+    </form>
     <form id="memory-form">
         <input name="id" type="hidden">
-        <input name="characterId" type="number" placeholder="Character ID" required>
+        <input name="characterId" type="number" placeholder="Character ID">
+        <input name="saveFileName" placeholder="Save file name">
+        <input name="playerName" placeholder="Player name">
+        <input name="farmName" placeholder="Farm name">
+        <input name="playerProfileId" type="number" min="1" placeholder="Profile ID">
+        <input name="npcName" placeholder="NPC name">
+        <input name="memoryType" value="Manual" placeholder="Memory type">
+        <input name="title" placeholder="Title">
         <input name="importance" type="number" min="1" max="5" value="3" required>
-        <textarea name="memoryText" placeholder="Memory text" required></textarea>
+        <input name="season" placeholder="Season">
+        <input name="day" type="number" min="0" placeholder="Day">
+        <input name="year" type="number" min="0" placeholder="Year">
+        <input name="location" placeholder="Location">
+        <input name="tags" placeholder="Tags">
+        <textarea name="summary" placeholder="Memory summary" required></textarea>
+        <label><input name="isActive" type="checkbox" checked> Active</label>
         <button type="submit">Save Memory</button>
     </form>
     <table id="memories"></table>

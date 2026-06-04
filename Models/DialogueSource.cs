@@ -20,4 +20,11 @@ public sealed class DialogueSource
     public DateTime LastSeen { get; set; }
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
+
+    /// <summary>
+    /// Absolute path to the mods folder root that was active when this source was scanned
+    /// (e.g. "D:\SteamLibrary\...\Mods"). Null for records inserted before this field existed.
+    /// Used to exclude sources from stale/archived mods folders at generation time.
+    /// </summary>
+    public string? SourceRootPath { get; set; }
 }

@@ -27,10 +27,17 @@ public sealed class DatabaseInitializer
         await ExecuteScriptAsync(connection, schemaSql);
         await MigrateCharactersTableAsync(connection);
         await MigrateCharactersUniqueNameConstraintAsync(connection);
+        await MigrateMemoriesTableAsync(connection);
         await MigrateGeneratedDialogueHistoryTableAsync(connection);
+        await AddMissingColumnsAsync(connection, "Memories", MemoryColumns);
+        await CreateMemoryIndexesAsync(connection);
         await AddMissingColumnsAsync(connection, "TestScenarios", new()
         {
             ["PlayerProfileId"] = "INTEGER NULL"
+        });
+        await AddMissingColumnsAsync(connection, "DialogueSources", new()
+        {
+            ["SourceRootPath"] = "TEXT NULL"
         });
         await AddMissingColumnsAsync(connection, "DialogueGenerationTrace", new()
         {
@@ -56,6 +63,29 @@ public sealed class DatabaseInitializer
             await BackfillCanonicalCharactersAsync(connection);
         }
     }
+
+    private static Dictionary<string, string> MemoryColumns { get; } = new()
+    {
+        ["SaveFileName"] = "TEXT NULL",
+        ["SaveFilePath"] = "TEXT NULL",
+        ["PlayerName"] = "TEXT NOT NULL DEFAULT ''",
+        ["FarmName"] = "TEXT NOT NULL DEFAULT ''",
+        ["PlayerProfileId"] = "INTEGER NULL",
+        ["NpcName"] = "TEXT NULL",
+        ["MemoryType"] = "TEXT NOT NULL DEFAULT 'Manual'",
+        ["Title"] = "TEXT NOT NULL DEFAULT ''",
+        ["Summary"] = "TEXT NOT NULL DEFAULT ''",
+        ["Season"] = "TEXT NOT NULL DEFAULT ''",
+        ["Day"] = "INTEGER NOT NULL DEFAULT 0",
+        ["Year"] = "INTEGER NOT NULL DEFAULT 0",
+        ["Location"] = "TEXT NOT NULL DEFAULT ''",
+        ["Source"] = "TEXT NOT NULL DEFAULT 'Manual'",
+        ["CreatedAt"] = "TEXT NOT NULL DEFAULT ''",
+        ["LastSeenAt"] = "TEXT NULL",
+        ["IsActive"] = "INTEGER NOT NULL DEFAULT 1",
+        ["Tags"] = "TEXT NOT NULL DEFAULT ''",
+        ["ReferenceId"] = "TEXT NOT NULL DEFAULT ''"
+    };
 
     private static async Task<bool> TableExistsAsync(SqliteConnection connection, string tableName)
     {
@@ -147,6 +177,66 @@ public sealed class DatabaseInitializer
             alterCommand.CommandText = $"ALTER TABLE GeneratedDialogueHistory ADD COLUMN {name} {definition};";
             await alterCommand.ExecuteNonQueryAsync();
         }
+    }
+
+    private static async Task MigrateMemoriesTableAsync(SqliteConnection connection)
+    {
+        if (!await TableExistsAsync(connection, "Memories"))
+            return;
+
+        bool characterIdIsNotNull = false;
+        await using (SqliteCommand command = connection.CreateCommand())
+        {
+            command.CommandText = "PRAGMA table_info(Memories);";
+            await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                if (reader.GetString(1).Equals("CharacterId", StringComparison.OrdinalIgnoreCase))
+                {
+                    characterIdIsNotNull = reader.GetInt32(3) == 1;
+                    break;
+                }
+            }
+        }
+
+        if (!characterIdIsNotNull)
+            return;
+
+        await ExecuteScriptAsync(connection, @"
+            PRAGMA foreign_keys = OFF;
+            PRAGMA legacy_alter_table = ON;
+
+            ALTER TABLE Memories RENAME TO Memories_OldCharacterRequired;
+
+            CREATE TABLE Memories (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                CharacterId INTEGER NULL,
+                MemoryText TEXT NOT NULL,
+                Importance INTEGER NOT NULL DEFAULT 1,
+                CreatedDate TEXT NOT NULL,
+                FOREIGN KEY (CharacterId) REFERENCES Characters(Id) ON DELETE CASCADE
+            );
+
+            INSERT INTO Memories (Id, CharacterId, MemoryText, Importance, CreatedDate)
+            SELECT Id, CharacterId, MemoryText, Importance, CreatedDate
+            FROM Memories_OldCharacterRequired;
+
+            DROP TABLE Memories_OldCharacterRequired;
+            PRAGMA legacy_alter_table = OFF;
+            PRAGMA foreign_keys = ON;
+            ");
+    }
+
+    private static async Task CreateMemoryIndexesAsync(SqliteConnection connection)
+    {
+        if (!await TableExistsAsync(connection, "Memories"))
+            return;
+
+        await ExecuteScriptAsync(connection, @"
+            CREATE INDEX IF NOT EXISTS IX_Memories_SaveFile_Npc ON Memories(SaveFileName, NpcName, IsActive, Importance);
+            CREATE UNIQUE INDEX IF NOT EXISTS IX_Memories_Automatic_Dedupe ON Memories(SaveFileName, MemoryType, IFNULL(NpcName, ''), ReferenceId)
+            WHERE Source = 'Automatic' AND ReferenceId <> '';
+            ");
     }
 
     /// <summary>Adds any missing columns to an existing table (no-op if the table is absent).</summary>

@@ -40,6 +40,15 @@ public sealed class CanonicalCharacterRepository
         return await GetByNameOrAliasAsync(connection, name);
     }
 
+    /// <summary>
+    /// Returns all <see cref="CharacterSource"/> rows for <paramref name="canonicalCharacterId"/>,
+    /// each annotated with an <see cref="CharacterSource.IsActive"/> flag derived from a LEFT JOIN
+    /// against <c>ScannedMods</c>.
+    /// Sources whose <c>SourceModId</c> has no <c>ScannedMods</c> entry (vanilla, custom, or
+    /// pre-scan rows) are treated as active (COALESCE → 1) so they are never accidentally dropped.
+    /// Callers should filter to <c>IsActive = true</c> for live generation and include all rows
+    /// for explainability traces.
+    /// </summary>
     public async Task<IReadOnlyList<CharacterSource>> GetSourcesAsync(long canonicalCharacterId)
     {
         List<CharacterSource> sources = new();
@@ -47,11 +56,17 @@ public sealed class CanonicalCharacterRepository
         await connection.OpenAsync();
 
         await using SqliteCommand command = connection.CreateCommand();
+        // LEFT JOIN ScannedMods so each row carries an IsActive indicator:
+        //   sm.IsActive = 1  → mod is currently installed and active
+        //   sm.IsActive = 0  → mod was uninstalled / deactivated in the last scan
+        //   sm.UniqueId IS NULL → no ScannedMods entry (vanilla/custom) → treat as active
         command.CommandText = @"
-            SELECT Id, CanonicalCharacterId, SourceModId, SourceType, Priority, Notes
-            FROM CharacterSources
-            WHERE CanonicalCharacterId = @canonicalCharacterId
-            ORDER BY Priority DESC, SourceType;
+            SELECT cs.Id, cs.CanonicalCharacterId, cs.SourceModId, cs.SourceType, cs.Priority, cs.Notes,
+                   COALESCE(sm.IsActive, 1) AS IsActive
+            FROM CharacterSources cs
+            LEFT JOIN ScannedMods sm ON cs.SourceModId = sm.UniqueId
+            WHERE cs.CanonicalCharacterId = @canonicalCharacterId
+            ORDER BY cs.Priority DESC, cs.SourceType;
             ";
         command.Parameters.AddWithValue("@canonicalCharacterId", canonicalCharacterId);
 
@@ -65,7 +80,8 @@ public sealed class CanonicalCharacterRepository
                 SourceModId = reader.GetString(2),
                 SourceType = reader.GetString(3),
                 Priority = reader.GetInt32(4),
-                Notes = reader.IsDBNull(5) ? null : reader.GetString(5)
+                Notes = reader.IsDBNull(5) ? null : reader.GetString(5),
+                IsActive = reader.GetInt32(6) == 1
             });
         }
 

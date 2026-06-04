@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using LivingLoreDialogue.Models;
 using LivingLoreDialogue.Repositories;
 
@@ -8,6 +9,9 @@ public sealed class DialogueSourceScannerService
 {
     private const int MaxFilesInspected = 20000;
     private static readonly TimeSpan MaxScanDuration = TimeSpan.FromSeconds(30);
+    private static readonly Regex FallbackDialoguePairRegex = new(
+        "\"(?<key>(?:\\\\.|[^\"\\\\])+)\"\\s*:\\s*\"(?<value>(?:\\\\.|[^\"\\\\])*)\"",
+        RegexOptions.Compiled | RegexOptions.Singleline);
 
     private static readonly JsonDocumentOptions JsonOptions = new()
     {
@@ -33,9 +37,12 @@ public sealed class DialogueSourceScannerService
         ScanBudget budget = new(scanTime);
         int sourcesFound = 0;
         List<string> errors = new();
+        List<string> warnings = new();
         List<DialogueSource> pendingSources = new();
+        HashSet<(string? SourceModId, string FilePath)> scannedDialogueFiles = new();
         HashSet<long> touchedCanonicalIds = new();
         string fullModsFolderPath = Path.GetFullPath(modsFolderPath);
+        // Store the normalised root path on every source so queries can filter by origin later.
         Dictionary<string, CanonicalCharacter> canonicalByName = (await this.canonicalRepository.GetAllAsync())
             .SelectMany(character => new[]
             {
@@ -52,6 +59,7 @@ public sealed class DialogueSourceScannerService
             ModManifest? manifest = ReadManifest(manifestPath);
             if (manifest is null || string.IsNullOrWhiteSpace(manifest.UniqueID))
                 continue;
+            IReadOnlyDictionary<string, string> i18n = ReadI18nDefaults(modDirectory);
 
             foreach (string filePath in EnumerateFilesGuarded(modDirectory, "*.json", scanTime, errors, budget))
             {
@@ -59,7 +67,7 @@ public sealed class DialogueSourceScannerService
                     continue;
 
                 string rawJson;
-                JsonDocument document;
+                DialogueParseResult parseResult;
                 try
                 {
                     rawJson = File.ReadAllText(filePath);
@@ -70,8 +78,8 @@ public sealed class DialogueSourceScannerService
                         continue;
                     }
 
-                    document = JsonDocument.Parse(rawJson, JsonOptions);
                     filesRead++;
+                    parseResult = TryParseDialogueJson(rawJson);
                 }
                 catch (Exception ex)
                 {
@@ -79,19 +87,61 @@ public sealed class DialogueSourceScannerService
                     continue;
                 }
 
-                using (document)
+                IReadOnlyList<DialogueSource> extracted;
+                if (parseResult.Document is not null)
                 {
-                    foreach (DialogueSource source in await ExtractSourcesAsync(document.RootElement, rawJson, filePath, manifest, scanTime, canonicalByName, aliasLookupCache))
+                    using (parseResult.Document)
                     {
-                        pendingSources.Add(source);
-                        touchedCanonicalIds.Add(source.CanonicalCharacterId);
-                        sourcesFound++;
+                        extracted = await ExtractSourcesAsync(parseResult.Document.RootElement, rawJson, filePath, manifest, scanTime, fullModsFolderPath, i18n, canonicalByName, aliasLookupCache);
+                    }
+                }
+                else
+                {
+                    extracted = await ExtractFallbackSourcesAsync(rawJson, filePath, manifest, scanTime, fullModsFolderPath, i18n, canonicalByName, aliasLookupCache);
+                }
+
+                string detectedCharacter = NameFromDialogueFilePath(filePath) ?? "(content patcher)";
+                scannedDialogueFiles.Add((manifest.UniqueID, filePath));
+                string warning = parseResult.Warning ?? "";
+                if (parseResult.Document is null && extracted.Count == 0 && !string.IsNullOrWhiteSpace(parseResult.Warning))
+                    errors.Add($"Skipped dialogue file '{filePath}': {parseResult.Warning}");
+                else if (!string.IsNullOrWhiteSpace(warning))
+                    warnings.Add($"Dialogue file '{filePath}' recovered with {parseResult.ParserUsed}; extracted {extracted.Count} line(s). Warning: {warning}");
+
+                warnings.Add($"Dialogue file '{filePath}': detectedCharacter='{detectedCharacter}', parser='{parseResult.ParserUsed}', linesExtracted={extracted.Count}{(string.IsNullOrWhiteSpace(warning) ? "" : $", warning='{warning}'")}.");
+
+                foreach (DialogueSource source in extracted)
+                {
+                    pendingSources.Add(source);
+                    touchedCanonicalIds.Add(source.CanonicalCharacterId);
+                    sourcesFound++;
+                }
+
+                if (extracted.Count == 0 && parseResult.Document is not null)
+                {
+                    IReadOnlyList<DialogueSource> fallbackExtracted = await ExtractFallbackSourcesAsync(rawJson, filePath, manifest, scanTime, fullModsFolderPath, i18n, canonicalByName, aliasLookupCache);
+                    if (fallbackExtracted.Count > 0)
+                    {
+                        warnings.Add($"Dialogue file '{filePath}' strict/lenient JSON produced 0 lines; fallback text extractor recovered {fallbackExtracted.Count} line(s).");
+                        foreach (DialogueSource source in fallbackExtracted)
+                        {
+                            pendingSources.Add(source);
+                            touchedCanonicalIds.Add(source.CanonicalCharacterId);
+                            sourcesFound++;
+                        }
                     }
                 }
             }
         }
 
         await this.dialogueSourceRepository.UpsertRangeAsync(pendingSources);
+        int staleFileSourcesDeactivated = await this.dialogueSourceRepository.DeactivateStaleForScannedFilesAsync(scannedDialogueFiles, scanTime);
+
+        // Cascade mod-level deactivations down to dialogue sources. Any source whose SourceModId
+        // refers to a mod that ScannedModRepository.MarkMissingInactiveAsync has deactivated will
+        // be marked inactive here, so GetForCanonicalAsync(activeOnly:true) never returns stale
+        // sources from old or removed mods.
+        int sourcesDeactivated = staleFileSourcesDeactivated + await this.dialogueSourceRepository.DeactivateForInactiveModsAsync();
 
         foreach (long canonicalId in touchedCanonicalIds)
             await this.dialogueSourceRepository.UpsertSummaryAsync(BuildSummary(canonicalId, await this.dialogueSourceRepository.GetForCanonicalAsync(canonicalId, activeOnly: true, limit: 200)));
@@ -101,7 +151,9 @@ public sealed class DialogueSourceScannerService
             FilesRead = filesRead,
             FilesInspected = budget.FilesInspected,
             SourcesFound = sourcesFound,
-            Errors = errors
+            SourcesDeactivated = sourcesDeactivated,
+            Errors = errors,
+            Warnings = warnings
         };
     }
 
@@ -144,6 +196,8 @@ public sealed class DialogueSourceScannerService
         string filePath,
         ModManifest manifest,
         DateTime scanTime,
+        string sourceRootPath,
+        IReadOnlyDictionary<string, string> i18n,
         IReadOnlyDictionary<string, CanonicalCharacter> canonicalByName,
         Dictionary<string, CanonicalCharacter?> aliasLookupCache)
     {
@@ -160,18 +214,31 @@ public sealed class DialogueSourceScannerService
                 string? targetName = NameFromDialogueTarget(target);
                 string? assetName = target;
 
-                foreach (string propertyName in new[] { "Entries", "Changes" })
+                foreach (string propertyName in new[] { "Entries", "Changes", "Data", "EditData" })
                 {
                     if (!patch.TryGetProperty(propertyName, out JsonElement entries) || entries.ValueKind != JsonValueKind.Object)
                         continue;
 
-                    foreach (JsonProperty entry in entries.EnumerateObject())
+                    foreach ((string key, string value) in EnumerateDialogueStrings(entries))
                     {
-                        string? characterName = targetName ?? NameFromEntryKey(entry.Name);
-                        if (string.IsNullOrWhiteSpace(characterName) || entry.Value.ValueKind is not JsonValueKind.String)
+                        string? characterName = targetName ?? NameFromEntryKey(key) ?? NameFromDialogueFilePath(filePath);
+                        if (string.IsNullOrWhiteSpace(characterName))
                             continue;
 
-                        DialogueSource? source = await BuildSourceAsync(characterName, entry.Name, entry.Value.GetString() ?? "", filePath, assetName, manifest, scanTime, target, canonicalByName, aliasLookupCache);
+                        DialogueSource? source = await BuildSourceAsync(characterName, key, value, filePath, assetName, manifest, scanTime, target, sourceRootPath, i18n, canonicalByName, aliasLookupCache);
+                        if (source is not null)
+                            sources.Add(source);
+                    }
+                }
+
+                if (patch.TryGetProperty("FromFile", out JsonElement fromFile) && fromFile.ValueKind == JsonValueKind.String)
+                {
+                    string? characterName = targetName ?? NameFromDialogueFilePath(fromFile.GetString() ?? "") ?? NameFromDialogueFilePath(filePath);
+                    if (!string.IsNullOrWhiteSpace(characterName))
+                    {
+                        string key = $"FromFile:{Path.GetFileName(fromFile.GetString() ?? filePath)}";
+                        string text = $"Content Patcher dialogue source file: {fromFile.GetString()}";
+                        DialogueSource? source = await BuildSourceAsync(characterName, key, text, filePath, assetName, manifest, scanTime, target, sourceRootPath, i18n, canonicalByName, aliasLookupCache);
                         if (source is not null)
                             sources.Add(source);
                     }
@@ -182,12 +249,9 @@ public sealed class DialogueSourceScannerService
         string? fileCharacterName = NameFromDialogueFilePath(filePath);
         if (!string.IsNullOrWhiteSpace(fileCharacterName) && root.ValueKind == JsonValueKind.Object)
         {
-            foreach (JsonProperty property in root.EnumerateObject())
+            foreach ((string key, string value) in EnumerateDialogueStrings(root))
             {
-                if (property.Value.ValueKind != JsonValueKind.String)
-                    continue;
-
-                DialogueSource? source = await BuildSourceAsync(fileCharacterName, property.Name, property.Value.GetString() ?? "", filePath, fileCharacterName, manifest, scanTime, null, canonicalByName, aliasLookupCache);
+                DialogueSource? source = await BuildSourceAsync(fileCharacterName, key, value, filePath, fileCharacterName, manifest, scanTime, null, sourceRootPath, i18n, canonicalByName, aliasLookupCache);
                 if (source is not null)
                     sources.Add(source);
             }
@@ -205,11 +269,16 @@ public sealed class DialogueSourceScannerService
         ModManifest manifest,
         DateTime scanTime,
         string? conditions,
+        string sourceRootPath,
+        IReadOnlyDictionary<string, string> i18n,
         IReadOnlyDictionary<string, CanonicalCharacter> canonicalByName,
         Dictionary<string, CanonicalCharacter?> aliasLookupCache)
     {
         CanonicalCharacter? canonical = await ResolveCanonicalAsync(characterName, canonicalByName, aliasLookupCache);
-        if (canonical is null || string.IsNullOrWhiteSpace(text))
+        string cleanedText = CleanDialogueText(ResolveI18nText(text, i18n));
+        if (canonical is null || string.IsNullOrWhiteSpace(cleanedText))
+            return null;
+        if (LooksLikeMetadata(dialogueKey, cleanedText) || LooksLikeUnresolvedI18n(cleanedText))
             return null;
 
         return new DialogueSource
@@ -219,14 +288,15 @@ public sealed class DialogueSourceScannerService
             FilePath = filePath,
             AssetName = assetName,
             DialogueKey = dialogueKey,
-            RawText = text,
+            RawText = cleanedText,
             Conditions = conditions,
             Season = InferSeason(dialogueKey),
             HeartLevel = InferHeartLevel(dialogueKey),
             RelationshipState = InferRelationshipState(filePath, dialogueKey),
             SourcePriority = SourcePriority(filePath, dialogueKey),
             IsActive = true,
-            LastSeen = scanTime
+            LastSeen = scanTime,
+            SourceRootPath = sourceRootPath
         };
     }
 
@@ -246,7 +316,351 @@ public sealed class DialogueSourceScannerService
         string parent = Path.GetFileName(Path.GetDirectoryName(normalized) ?? "");
         return parent.Equals("dialogue", StringComparison.OrdinalIgnoreCase)
             || fileName.StartsWith("marriagedialogue", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("/characters/dialogue/");
+            || normalized.Contains("/characters/dialogue/")
+            || normalized.Contains("/characterfiles/dialogue/");
+    }
+
+    private async Task<IReadOnlyList<DialogueSource>> ExtractFallbackSourcesAsync(
+        string rawText,
+        string filePath,
+        ModManifest manifest,
+        DateTime scanTime,
+        string sourceRootPath,
+        IReadOnlyDictionary<string, string> i18n,
+        IReadOnlyDictionary<string, CanonicalCharacter> canonicalByName,
+        Dictionary<string, CanonicalCharacter?> aliasLookupCache)
+    {
+        List<DialogueSource> sources = new();
+        string? fileCharacterName = NameFromDialogueFilePath(filePath);
+
+        foreach (Match match in FallbackDialoguePairRegex.Matches(rawText))
+        {
+            string key = Regex.Unescape(match.Groups["key"].Value);
+            string value = DecodeJsonStringLenient(match.Groups["value"].Value);
+            if (string.IsNullOrWhiteSpace(value) || LooksLikeMetadata(key, value) || LooksLikeUnresolvedI18n(value))
+                continue;
+
+            string? characterName = fileCharacterName ?? CharacterNameNearFallbackMatch(rawText, match.Index) ?? NameFromEntryKey(key);
+            if (string.IsNullOrWhiteSpace(characterName))
+                continue;
+
+            DialogueSource? source = await BuildSourceAsync(
+                characterName,
+                key,
+                value,
+                filePath,
+                fileCharacterName ?? characterName,
+                manifest,
+                scanTime,
+                "fallback text extractor",
+                sourceRootPath,
+                i18n,
+                canonicalByName,
+                aliasLookupCache);
+            if (source is not null)
+                sources.Add(source);
+        }
+
+        return sources
+            .GroupBy(source => $"{source.CanonicalCharacterId}|{source.DialogueKey}|{source.RawText}", StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+    }
+
+    private static IEnumerable<(string Key, string Value)> EnumerateDialogueStrings(JsonElement element, string prefix = "")
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+            yield break;
+
+        foreach (JsonProperty property in element.EnumerateObject())
+        {
+            string key = string.IsNullOrWhiteSpace(prefix) ? property.Name : $"{prefix}/{property.Name}";
+            if (property.Value.ValueKind == JsonValueKind.String)
+            {
+                yield return (key, property.Value.GetString() ?? "");
+                continue;
+            }
+
+            if (property.Value.ValueKind == JsonValueKind.Object && IsDialogueContainer(property.Name))
+            {
+                foreach ((string childKey, string childValue) in EnumerateDialogueStrings(property.Value, key))
+                    yield return (childKey, childValue);
+            }
+        }
+    }
+
+    private static bool IsDialogueContainer(string propertyName)
+    {
+        return propertyName.Equals("Entries", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("Changes", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("Data", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("EditData", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Equals("Fields", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static DialogueParseResult TryParseDialogueJson(string rawJson)
+    {
+        try
+        {
+            return new DialogueParseResult(JsonDocument.Parse(rawJson, JsonOptions), "strict JSON", null);
+        }
+        catch (JsonException strictEx)
+        {
+            string normalized = NormalizeJsonText(rawJson);
+            try
+            {
+                return new DialogueParseResult(JsonDocument.Parse(normalized, JsonOptions), "lenient JSON", strictEx.Message);
+            }
+            catch (JsonException lenientEx)
+            {
+                return new DialogueParseResult(null, "fallback text extractor", lenientEx.Message);
+            }
+        }
+    }
+
+    private static string NormalizeJsonText(string rawJson)
+    {
+        string normalized = rawJson.Replace("\r\n", "\n").Replace('\r', '\n');
+        return EscapeControlCharactersInsideStrings(normalized);
+    }
+
+    private static string EscapeControlCharactersInsideStrings(string text)
+    {
+        System.Text.StringBuilder builder = new(text.Length);
+        bool inString = false;
+        bool escaped = false;
+
+        foreach (char ch in text)
+        {
+            if (inString && !escaped && ch < 0x20)
+            {
+                builder.Append(ch switch
+                {
+                    '\n' => "\\n",
+                    '\t' => "\\t",
+                    '\b' => "\\b",
+                    '\f' => "\\f",
+                    _ => $"\\u{(int)ch:x4}"
+                });
+                continue;
+            }
+
+            builder.Append(ch);
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+
+            if (ch == '\\' && inString)
+            {
+                escaped = true;
+                continue;
+            }
+
+            if (ch == '"')
+                inString = !inString;
+        }
+
+        return builder.ToString();
+    }
+
+    private static string DecodeJsonStringLenient(string value)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<string>($"\"{value}\"") ?? "";
+        }
+        catch
+        {
+            return value
+                .Replace("\\n", "\n", StringComparison.Ordinal)
+                .Replace("\\r", "\r", StringComparison.Ordinal)
+                .Replace("\\t", "\t", StringComparison.Ordinal)
+                .Replace("\\\"", "\"", StringComparison.Ordinal)
+                .Replace("\\\\", "\\", StringComparison.Ordinal);
+        }
+    }
+
+    private static string CleanDialogueText(string text)
+    {
+        string cleaned = text.Replace("\r\n", "\n").Replace('\r', '\n').Trim();
+        cleaned = Regex.Replace(cleaned, @"\$(?:[a-zA-Z0-9_]+(?:#[^$]*)?)?", " ");
+        cleaned = Regex.Replace(cleaned, @"#[a-zA-Z0-9_]+", " ");
+        cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim();
+        return cleaned;
+    }
+
+    private static IReadOnlyDictionary<string, string> ReadI18nDefaults(string modDirectory)
+    {
+        string path = Path.Combine(modDirectory, "i18n", "default.json");
+        if (!File.Exists(path))
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            string raw = NormalizeJsonText(File.ReadAllText(path));
+            using JsonDocument document = JsonDocument.Parse(raw, JsonOptions);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            Dictionary<string, string> values = new(StringComparer.OrdinalIgnoreCase);
+            foreach (JsonProperty property in document.RootElement.EnumerateObject())
+            {
+                if (property.Value.ValueKind == JsonValueKind.String)
+                    values[property.Name] = property.Value.GetString() ?? "";
+            }
+
+            return values;
+        }
+        catch
+        {
+            try
+            {
+                string raw = File.ReadAllText(path);
+                Dictionary<string, string> values = new(StringComparer.OrdinalIgnoreCase);
+                foreach (Match match in FallbackDialoguePairRegex.Matches(raw))
+                {
+                    string key = Regex.Unescape(match.Groups["key"].Value);
+                    string value = DecodeJsonStringLenient(match.Groups["value"].Value);
+                    if (!string.IsNullOrWhiteSpace(key) && !string.IsNullOrWhiteSpace(value))
+                        values[key] = value;
+                }
+
+                return values;
+            }
+            catch
+            {
+                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+        }
+    }
+
+    private static string ResolveI18nText(string text, IReadOnlyDictionary<string, string> i18n)
+    {
+        if (i18n.Count == 0 || !text.Contains("{{i18n:", StringComparison.OrdinalIgnoreCase))
+            return text;
+
+        System.Text.StringBuilder builder = new(text.Length);
+        int index = 0;
+        while (index < text.Length)
+        {
+            int start = text.IndexOf("{{i18n:", index, StringComparison.OrdinalIgnoreCase);
+            if (start < 0)
+            {
+                builder.Append(text[index..]);
+                break;
+            }
+
+            builder.Append(text[index..start]);
+            int end = FindTokenEnd(text, start);
+            if (end < 0)
+            {
+                builder.Append(text[start..]);
+                break;
+            }
+
+            string token = text[start..(end + 2)];
+            string? resolved = ResolveI18nToken(token, i18n);
+            builder.Append(resolved ?? token);
+            index = end + 2;
+        }
+
+        return builder.ToString();
+    }
+
+    private static int FindTokenEnd(string text, int start)
+    {
+        int depth = 0;
+        for (int i = start; i < text.Length - 1; i++)
+        {
+            if (text[i] == '{' && text[i + 1] == '{')
+            {
+                depth++;
+                i++;
+                continue;
+            }
+
+            if (text[i] == '}' && text[i + 1] == '}')
+            {
+                depth--;
+                if (depth == 0)
+                    return i;
+                i++;
+            }
+        }
+
+        return -1;
+    }
+
+    private static string? ResolveI18nToken(string token, IReadOnlyDictionary<string, string> i18n)
+    {
+        string body = token["{{i18n:".Length..^2].Trim();
+        int defaultIndex = body.IndexOf("|default=", StringComparison.OrdinalIgnoreCase);
+        string keyExpression = defaultIndex >= 0 ? body[..defaultIndex].Trim() : body.Trim();
+        string? resolved = ResolveI18nKeyExpression(keyExpression, i18n);
+        if (!string.IsNullOrWhiteSpace(resolved))
+            return resolved;
+
+        if (defaultIndex >= 0)
+        {
+            string defaultExpression = body[(defaultIndex + "|default=".Length)..].Trim();
+            if (defaultExpression.StartsWith("{{i18n:", StringComparison.OrdinalIgnoreCase))
+                return ResolveI18nText(defaultExpression, i18n);
+        }
+
+        return null;
+    }
+
+    private static string? ResolveI18nKeyExpression(string keyExpression, IReadOnlyDictionary<string, string> i18n)
+    {
+        string key = keyExpression.Trim();
+        if (i18n.TryGetValue(key, out string? exact))
+            return exact;
+
+        int templateStart = key.IndexOf("{{", StringComparison.Ordinal);
+        if (templateStart > 0)
+        {
+            string prefix = key[..templateStart];
+            return i18n
+                .Where(pair => pair.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(pair => pair.Value)
+                .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+        }
+
+        return null;
+    }
+
+    private static bool LooksLikeMetadata(string key, string value)
+    {
+        string lowerKey = key.ToLowerInvariant();
+        if (lowerKey is "action" or "target" or "fromfile" or "targetfield" or "when" or "update" or "enabled" or "logname")
+            return true;
+        if (lowerKey.EndsWith("/action", StringComparison.OrdinalIgnoreCase)
+            || lowerKey.EndsWith("/target", StringComparison.OrdinalIgnoreCase)
+            || lowerKey.EndsWith("/fromfile", StringComparison.OrdinalIgnoreCase)
+            || lowerKey.EndsWith("/targetfield", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return value.StartsWith("Characters/", StringComparison.OrdinalIgnoreCase)
+            || value.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool LooksLikeUnresolvedI18n(string value)
+    {
+        string trimmed = value.Trim();
+        return trimmed.Contains("{{i18n:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("i18n:", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? CharacterNameNearFallbackMatch(string rawText, int matchIndex)
+    {
+        int start = Math.Max(0, matchIndex - 600);
+        string window = rawText[start..matchIndex];
+        Match target = Regex.Match(window, "\"Target\"\\s*:\\s*\"Characters/Dialogue/(?<name>[^\"]+)\"", RegexOptions.IgnoreCase | RegexOptions.RightToLeft);
+        if (target.Success)
+            return CleanName(target.Groups["name"].Value.Split('/')[0]);
+        return null;
     }
 
     private async Task<CanonicalCharacter?> ResolveCanonicalAsync(
@@ -288,7 +702,7 @@ public sealed class DialogueSourceScannerService
         string name = Path.GetFileNameWithoutExtension(filePath);
         if (name.Equals("content", StringComparison.OrdinalIgnoreCase)
             || name.Equals("manifest", StringComparison.OrdinalIgnoreCase)
-            || name.StartsWith("MarriageDialogue", StringComparison.OrdinalIgnoreCase))
+            || name.Contains("Dialogue", StringComparison.OrdinalIgnoreCase))
             return Path.GetFileName(Path.GetDirectoryName(filePath) ?? "");
 
         return CleanName(name);
@@ -373,6 +787,7 @@ public sealed class DialogueSourceScannerService
     }
 
     private sealed record ModManifest(string Name, string UniqueID, string? Version, string? Author);
+    private sealed record DialogueParseResult(JsonDocument? Document, string ParserUsed, string? Warning);
 
     private static IEnumerable<string> EnumerateFilesGuarded(
         string rootPath,
@@ -469,5 +884,7 @@ public sealed class DialogueSourceScanSummary
     public int FilesRead { get; set; }
     public int FilesInspected { get; set; }
     public int SourcesFound { get; set; }
+    public int SourcesDeactivated { get; set; }
     public IReadOnlyList<string> Errors { get; set; } = Array.Empty<string>();
+    public IReadOnlyList<string> Warnings { get; set; } = Array.Empty<string>();
 }

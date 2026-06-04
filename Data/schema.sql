@@ -103,10 +103,29 @@ CREATE TABLE IF NOT EXISTS Events (
 
 CREATE TABLE IF NOT EXISTS Memories (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
-    CharacterId INTEGER NOT NULL,
+    CharacterId INTEGER NULL,
+    SaveFileName TEXT NULL,
+    SaveFilePath TEXT NULL,
+    PlayerName TEXT NOT NULL DEFAULT '',
+    FarmName TEXT NOT NULL DEFAULT '',
+    PlayerProfileId INTEGER NULL,
+    NpcName TEXT NULL,
+    MemoryType TEXT NOT NULL DEFAULT 'Manual',
+    Title TEXT NOT NULL DEFAULT '',
+    Summary TEXT NOT NULL DEFAULT '',
     MemoryText TEXT NOT NULL,
     Importance INTEGER NOT NULL DEFAULT 1,
+    Season TEXT NOT NULL DEFAULT '',
+    Day INTEGER NOT NULL DEFAULT 0,
+    Year INTEGER NOT NULL DEFAULT 0,
+    Location TEXT NOT NULL DEFAULT '',
+    Source TEXT NOT NULL DEFAULT 'Manual',
     CreatedDate TEXT NOT NULL,
+    CreatedAt TEXT NOT NULL DEFAULT '',
+    LastSeenAt TEXT NULL,
+    IsActive INTEGER NOT NULL DEFAULT 1,
+    Tags TEXT NOT NULL DEFAULT '',
+    ReferenceId TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (CharacterId) REFERENCES Characters(Id) ON DELETE CASCADE
 );
 
@@ -167,6 +186,7 @@ CREATE TABLE IF NOT EXISTS DialogueSources (
     LastSeen TEXT NOT NULL,
     CreatedAt TEXT NOT NULL,
     UpdatedAt TEXT NOT NULL,
+    SourceRootPath TEXT NULL,
     FOREIGN KEY (CanonicalCharacterId) REFERENCES CanonicalCharacters(Id) ON DELETE CASCADE
 );
 

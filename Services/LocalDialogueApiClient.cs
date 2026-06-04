@@ -28,6 +28,7 @@ public sealed class LocalDialogueApiClient
 
     public async Task<GeneratedDialogueResult?> GenerateAsync(DialogueContext context, string requestSource = "SMAPI")
     {
+        string effectiveSource = string.IsNullOrWhiteSpace(context.RequestSource) ? requestSource : context.RequestSource;
         var payload = new
         {
             context.InterceptedNpcName,
@@ -41,13 +42,28 @@ public sealed class LocalDialogueApiClient
             context.Weather,
             context.Location,
             context.FriendshipLevel,
-            RequestSource = string.IsNullOrWhiteSpace(context.RequestSource) ? requestSource : context.RequestSource,
+            RequestSource = effectiveSource,
+            ActivePlayerProfileId = (long?)null,  // SMAPI does not know the profile id; server resolves it
             SaveContext = context.SaveContext
         };
 
         string baseUrl = this.httpClient.BaseAddress?.ToString().TrimEnd('/') ?? "(no base url)";
         string requestJson = JsonSerializer.Serialize(payload);
-        this.logInfo?.Invoke($"[Server request] About to call {baseUrl}{Endpoint} (source={requestSource}).");
+        this.logInfo?.Invoke($"[Server request] About to call {baseUrl}{Endpoint} (source={effectiveSource}).");
+
+        // Log the save identity fields so they are visible in the SMAPI console for diagnostics.
+        if (context.SaveContext is SaveFileContextSnapshot sc)
+        {
+            this.logInfo?.Invoke(
+                $"[Server request] Save context: saveFileName={sc.SaveFileName ?? "(none)"}, " +
+                $"playerName={sc.PlayerName}, farmName={sc.FarmName}, location={sc.Location}.");
+            this.logInfo?.Invoke($"[Server request] Active player profile id sent: (none — server will auto-resolve).");
+        }
+        else
+        {
+            this.logInfo?.Invoke("[Server request] No save context attached — server will use defaults.");
+        }
+
         this.logInfo?.Invoke($"[Server request] Payload: {Preview(requestJson)}");
 
         try
@@ -79,6 +95,38 @@ public sealed class LocalDialogueApiClient
         {
             this.logError?.Invoke($"[Server request] Exception calling server: {ex.GetType().Name}: {ex.Message}");
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Registers vanilla dialogue for one character with the server so the prompt builder has
+    /// canonical examples even when no Content Patcher mods are installed. Never throws.
+    /// </summary>
+    public async Task RegisterVanillaDialogueAsync(string characterName, IReadOnlyDictionary<string, string> entries)
+    {
+        if (string.IsNullOrWhiteSpace(characterName) || entries.Count == 0)
+            return;
+
+        const string endpoint = "/api/dialogue/register-vanilla";
+        var payload = new { characterName, entries };
+
+        this.logInfo?.Invoke($"[VanillaDialogue] Registering {entries.Count} line(s) for '{characterName}'.");
+
+        try
+        {
+            using HttpResponseMessage response = await this.httpClient.PostAsJsonAsync(endpoint, payload);
+            if (!response.IsSuccessStatusCode)
+            {
+                this.logError?.Invoke($"[VanillaDialogue] Server returned {(int)response.StatusCode} for '{characterName}'; skipping.");
+                return;
+            }
+
+            string body = await response.Content.ReadAsStringAsync();
+            this.logInfo?.Invoke($"[VanillaDialogue] '{characterName}' registered. Response: {Preview(body)}");
+        }
+        catch (Exception ex)
+        {
+            this.logError?.Invoke($"[VanillaDialogue] Exception registering '{characterName}': {ex.Message}");
         }
     }
 

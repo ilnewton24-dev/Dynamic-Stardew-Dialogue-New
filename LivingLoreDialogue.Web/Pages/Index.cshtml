@@ -1,13 +1,13 @@
 @page
 <section class="page">
-    <h2>Dashboard</h2>
-    <p class="page-intro">Monitor the local lore database, generation pipeline, scan history, and narrative activity across your installed Stardew mods.</p>
+    <h2>Codex Board</h2>
+    <p class="page-intro">Watch the valley ledger, character lore, and generated dialogue threads from one enchanted control board.</p>
 
     <div class="dashboard-grid">
         <section class="card span-6" id="openai-panel">
             <div class="card-header">
-                <h3>OpenAI Connection</h3>
-                <span class="chip">Model Control</span>
+                <h3>Oracle Connection</h3>
+                <span class="chip">Model Sigil</span>
             </div>
             <div class="metrics" id="openai-status"></div>
             <div class="action-row">
@@ -24,18 +24,18 @@
         </section>
 
         <section class="card span-6">
-            <h3>Recent Generated Dialogue</h3>
+            <h3>Recent Spoken Lines</h3>
             <div id="dialogue-cards" class="dialogue-list"></div>
         </section>
 
         <section class="card span-6">
-            <h3>Operational Snapshot</h3>
+            <h3>Ledger Snapshot</h3>
             <div id="dashboard-charts" class="chart-bars"></div>
         </section>
 
         <section class="card span-12">
             <div class="panel-header">
-                <h3>Activity Timeline</h3>
+                <h3>Chronicle Timeline</h3>
                 <span class="chip">Recent Lore Changes</span>
             </div>
             <table id="changes"></table>

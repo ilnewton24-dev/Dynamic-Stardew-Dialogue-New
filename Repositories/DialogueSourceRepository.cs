@@ -24,12 +24,12 @@ public sealed class DialogueSourceRepository
             INSERT INTO DialogueSources (
                 CanonicalCharacterId, SourceModId, FilePath, AssetName, DialogueKey, RawText,
                 Conditions, Season, Weather, Location, HeartLevel, RelationshipState,
-                SourcePriority, IsActive, LastSeen, CreatedAt, UpdatedAt
+                SourcePriority, IsActive, LastSeen, CreatedAt, UpdatedAt, SourceRootPath
             )
             VALUES (
                 @canonicalCharacterId, @sourceModId, @filePath, @assetName, @dialogueKey, @rawText,
                 @conditions, @season, @weather, @location, @heartLevel, @relationshipState,
-                @sourcePriority, 1, @lastSeen, @now, @now
+                @sourcePriority, 1, @lastSeen, @now, @now, @sourceRootPath
             )
             ON CONFLICT(CanonicalCharacterId, SourceModId, FilePath, DialogueKey) DO UPDATE SET
                 AssetName = excluded.AssetName,
@@ -43,7 +43,8 @@ public sealed class DialogueSourceRepository
                 SourcePriority = excluded.SourcePriority,
                 IsActive = 1,
                 LastSeen = excluded.LastSeen,
-                UpdatedAt = excluded.UpdatedAt;
+                UpdatedAt = excluded.UpdatedAt,
+                SourceRootPath = excluded.SourceRootPath;
             ";
         AddParameters(command, source, now);
         await command.ExecuteNonQueryAsync();
@@ -62,12 +63,12 @@ public sealed class DialogueSourceRepository
             INSERT INTO DialogueSources (
                 CanonicalCharacterId, SourceModId, FilePath, AssetName, DialogueKey, RawText,
                 Conditions, Season, Weather, Location, HeartLevel, RelationshipState,
-                SourcePriority, IsActive, LastSeen, CreatedAt, UpdatedAt
+                SourcePriority, IsActive, LastSeen, CreatedAt, UpdatedAt, SourceRootPath
             )
             VALUES (
                 @canonicalCharacterId, @sourceModId, @filePath, @assetName, @dialogueKey, @rawText,
                 @conditions, @season, @weather, @location, @heartLevel, @relationshipState,
-                @sourcePriority, 1, @lastSeen, @now, @now
+                @sourcePriority, 1, @lastSeen, @now, @now, @sourceRootPath
             )
             ON CONFLICT(CanonicalCharacterId, SourceModId, FilePath, DialogueKey) DO UPDATE SET
                 AssetName = excluded.AssetName,
@@ -81,7 +82,8 @@ public sealed class DialogueSourceRepository
                 SourcePriority = excluded.SourcePriority,
                 IsActive = 1,
                 LastSeen = excluded.LastSeen,
-                UpdatedAt = excluded.UpdatedAt;
+                UpdatedAt = excluded.UpdatedAt,
+                SourceRootPath = excluded.SourceRootPath;
             ";
 
         foreach (DialogueSource source in sources)
@@ -94,6 +96,43 @@ public sealed class DialogueSourceRepository
         await transaction.CommitAsync();
     }
 
+    public async Task<int> DeactivateStaleForScannedFilesAsync(IEnumerable<(string? SourceModId, string FilePath)> scannedFiles, DateTime scanTime)
+    {
+        List<(string? SourceModId, string FilePath)> files = scannedFiles
+            .Distinct()
+            .ToList();
+        if (files.Count == 0)
+            return 0;
+
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+        await using SqliteTransaction transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+
+        int deactivated = 0;
+        foreach ((string? sourceModId, string filePath) in files)
+        {
+            await using SqliteCommand command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+                UPDATE DialogueSources
+                SET IsActive = 0,
+                    UpdatedAt = @now
+                WHERE FilePath = @filePath
+                  AND IFNULL(SourceModId, '') = IFNULL(@sourceModId, '')
+                  AND LastSeen < @scanTime
+                  AND IsActive = 1;
+                ";
+            command.Parameters.AddWithValue("@filePath", filePath);
+            command.Parameters.AddWithValue("@sourceModId", (object?)sourceModId ?? DBNull.Value);
+            command.Parameters.AddWithValue("@scanTime", scanTime.ToString("O"));
+            command.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("O"));
+            deactivated += await command.ExecuteNonQueryAsync();
+        }
+
+        await transaction.CommitAsync();
+        return deactivated;
+    }
+
     public async Task<IReadOnlyList<DialogueSource>> GetForCanonicalAsync(long canonicalCharacterId, bool activeOnly = true, int limit = 300)
     {
         List<DialogueSource> sources = new();
@@ -101,20 +140,28 @@ public sealed class DialogueSourceRepository
         await connection.OpenAsync();
 
         await using SqliteCommand command = connection.CreateCommand();
+        // When activeOnly=true we also JOIN against ScannedMods so that sources whose mod was
+        // deactivated (but whose own IsActive flag hasn't been cascaded yet) are excluded too.
+        // sm.UniqueId IS NULL after a LEFT JOIN means no ScannedMods entry — we fail open so
+        // vanilla-era records without a ScannedMod row are not accidentally dropped.
         command.CommandText = activeOnly
             ? @"
-              SELECT Id, CanonicalCharacterId, SourceModId, FilePath, AssetName, DialogueKey, RawText,
-                     Conditions, Season, Weather, Location, HeartLevel, RelationshipState,
-                     SourcePriority, IsActive, LastSeen, CreatedAt, UpdatedAt
-              FROM DialogueSources
-              WHERE CanonicalCharacterId = @canonicalCharacterId AND IsActive = 1
-              ORDER BY SourcePriority DESC, DialogueKey
+              SELECT ds.Id, ds.CanonicalCharacterId, ds.SourceModId, ds.FilePath, ds.AssetName,
+                     ds.DialogueKey, ds.RawText, ds.Conditions, ds.Season, ds.Weather, ds.Location,
+                     ds.HeartLevel, ds.RelationshipState, ds.SourcePriority, ds.IsActive,
+                     ds.LastSeen, ds.CreatedAt, ds.UpdatedAt, ds.SourceRootPath
+              FROM DialogueSources ds
+              LEFT JOIN ScannedMods sm ON ds.SourceModId = sm.UniqueId
+              WHERE ds.CanonicalCharacterId = @canonicalCharacterId
+                AND ds.IsActive = 1
+                AND (ds.SourceModId IS NULL OR sm.IsActive = 1 OR sm.UniqueId IS NULL)
+              ORDER BY ds.SourcePriority DESC, ds.DialogueKey
               LIMIT @limit;
               "
             : @"
               SELECT Id, CanonicalCharacterId, SourceModId, FilePath, AssetName, DialogueKey, RawText,
                      Conditions, Season, Weather, Location, HeartLevel, RelationshipState,
-                     SourcePriority, IsActive, LastSeen, CreatedAt, UpdatedAt
+                     SourcePriority, IsActive, LastSeen, CreatedAt, UpdatedAt, SourceRootPath
               FROM DialogueSources
               WHERE CanonicalCharacterId = @canonicalCharacterId
               ORDER BY IsActive DESC, SourcePriority DESC, DialogueKey
@@ -160,6 +207,50 @@ public sealed class DialogueSourceRepository
             ImportantCanonFacts = reader.GetString(6),
             LastGeneratedAt = DateTime.Parse(reader.GetString(7))
         };
+    }
+
+    /// <summary>
+    /// Marks dialogue sources inactive when their source mod is no longer active in ScannedMods.
+    /// This cascades the deactivation that <see cref="ScannedModRepository.MarkMissingInactiveAsync"/>
+    /// performs on the mod level down to the source level.
+    /// Historical records are retained; only IsActive is set to 0.
+    /// Returns the number of sources deactivated.
+    /// Sources with SourceModId starting with "StardewValley." are never deactivated — they are
+    /// vanilla game content extracted via SMAPI, not from any Mods folder.
+    /// </summary>
+    public async Task<int> DeactivateForInactiveModsAsync()
+    {
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = @"
+            UPDATE DialogueSources
+            SET IsActive = 0, UpdatedAt = @timestamp
+            WHERE IsActive = 1
+              AND SourceModId IS NOT NULL
+              AND SourceModId NOT LIKE 'StardewValley.%'
+              AND SourceModId NOT IN (SELECT UniqueId FROM ScannedMods WHERE IsActive = 1);
+            ";
+        command.Parameters.AddWithValue("@timestamp", DateTime.UtcNow.ToString("O"));
+        return await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>Returns the number of active dialogue sources for a canonical character.</summary>
+    public async Task<int> CountActiveForCanonicalAsync(long canonicalCharacterId)
+    {
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = @"
+            SELECT COUNT(*)
+            FROM DialogueSources ds
+            LEFT JOIN ScannedMods sm ON ds.SourceModId = sm.UniqueId
+            WHERE ds.CanonicalCharacterId = @canonicalCharacterId
+              AND ds.IsActive = 1
+              AND (ds.SourceModId IS NULL OR sm.IsActive = 1 OR sm.UniqueId IS NULL);
+            ";
+        command.Parameters.AddWithValue("@canonicalCharacterId", canonicalCharacterId);
+        return Convert.ToInt32(await command.ExecuteScalarAsync());
     }
 
     public async Task UpsertSummaryAsync(DialogueSourceSummary summary)
@@ -212,6 +303,7 @@ public sealed class DialogueSourceRepository
         command.Parameters.AddWithValue("@sourcePriority", source.SourcePriority);
         command.Parameters.AddWithValue("@lastSeen", source.LastSeen.ToString("O"));
         command.Parameters.AddWithValue("@now", now);
+        command.Parameters.AddWithValue("@sourceRootPath", (object?)source.SourceRootPath ?? DBNull.Value);
     }
 
     private static DialogueSource Map(SqliteDataReader reader)
@@ -235,7 +327,8 @@ public sealed class DialogueSourceRepository
             IsActive = reader.GetInt32(14) == 1,
             LastSeen = DateTime.Parse(reader.GetString(15)),
             CreatedAt = DateTime.Parse(reader.GetString(16)),
-            UpdatedAt = DateTime.Parse(reader.GetString(17))
+            UpdatedAt = DateTime.Parse(reader.GetString(17)),
+            SourceRootPath = reader.FieldCount > 18 && !reader.IsDBNull(18) ? reader.GetString(18) : null
         };
     }
 }

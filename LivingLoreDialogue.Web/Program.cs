@@ -85,7 +85,8 @@ builder.Services.AddScoped<DialogueContextBuilderService>(sp => new DialogueCont
     sp.GetRequiredService<SaveFileContextService>(),
     sp.GetRequiredService<DialogueContextSelectionService>(),
     sp.GetRequiredService<PlayerProfileRepository>(),
-    sp.GetRequiredService<LivingLoreWebOptions>().MaxRecentMemories));
+    sp.GetRequiredService<LivingLoreWebOptions>().MaxRecentMemories,
+    sp.GetRequiredService<LivingLoreWebOptions>().ModsFolderPath));
 builder.Services.AddScoped<ModScanCoordinator>(sp => new ModScanCoordinator(
     async () =>
     {
@@ -317,15 +318,36 @@ app.MapPost("/api/merge-review/merge", async (MergeDuplicatesRequest request, Ca
     return Results.Ok(new { merged });
 });
 
-app.MapGet("/api/memories", async (MemoryRepository repo) => Results.Ok(await repo.GetAllAsync()));
+app.MapGet("/api/memories", async (HttpRequest http, MemoryRepository repo) =>
+{
+    string? saveFileName = http.Query["saveFileName"].FirstOrDefault();
+    string? npcName = http.Query["npcName"].FirstOrDefault();
+    bool includeInactive = !bool.TryParse(http.Query["includeInactive"].FirstOrDefault(), out bool parsedIncludeInactive) || parsedIncludeInactive;
+    long? playerProfileId = long.TryParse(http.Query["playerProfileId"].FirstOrDefault(), out long parsedProfileId)
+        ? parsedProfileId
+        : null;
+    return Results.Ok(await repo.GetAllAsync(saveFileName, playerProfileId, npcName, includeInactive));
+});
 app.MapPost("/api/memories", async (MemoryRequest request, MemoryRepository repo) =>
 {
-    long id = await repo.AddAsync(request.CharacterId, request.MemoryText, request.Importance);
+    Memory memory = request.ToMemory();
+    memory.Source = string.IsNullOrWhiteSpace(memory.Source) ? "Manual" : memory.Source;
+    long id = await repo.AddManualAsync(memory);
     return Results.Ok(new { id });
 });
 app.MapPut("/api/memories/{id:long}", async (long id, MemoryRequest request, MemoryRepository repo) =>
 {
-    await repo.UpdateAsync(id, request.CharacterId, request.MemoryText, request.Importance);
+    await repo.UpdateAsync(id, request.ToMemory());
+    return Results.NoContent();
+});
+app.MapPost("/api/memories/{id:long}/deactivate", async (long id, MemoryRepository repo) =>
+{
+    await repo.SetActiveAsync(id, false);
+    return Results.NoContent();
+});
+app.MapDelete("/api/memories/{id:long}", async (long id, MemoryRepository repo) =>
+{
+    await repo.DeleteAsync(id);
     return Results.NoContent();
 });
 
@@ -404,6 +426,54 @@ app.MapGet("/api/mods/scan/status/{scanRunId}", (string scanRunId, DashboardScan
 {
     DashboardScanRunStatus? status = scans.GetStatus(scanRunId);
     return status is null ? Results.NotFound(new { error = "Scan run was not found." }) : Results.Ok(status);
+});
+
+// Registers vanilla dialogue for one character extracted by the SMAPI mod at save-load time.
+// Sources are stored with SourceModId = "StardewValley.Vanilla" which is exempt from scan deactivation.
+app.MapPost("/api/dialogue/register-vanilla", async (
+    VanillaDialogueRequest request,
+    CanonicalCharacterRepository canonicalRepo,
+    DialogueSourceRepository dialogueSourceRepo,
+    ILoggerFactory loggerFactory) =>
+{
+    ILogger logger = loggerFactory.CreateLogger("VanillaDialogueEndpoint");
+
+    if (string.IsNullOrWhiteSpace(request.CharacterName) || request.Entries is null || request.Entries.Count == 0)
+        return Results.BadRequest(new { error = "CharacterName and at least one entry are required." });
+
+    CanonicalCharacter? canonical = await canonicalRepo.GetByNameOrAliasAsync(request.CharacterName);
+    if (canonical is null)
+    {
+        logger.LogDebug("[VanillaDialogue] Canonical character '{CharacterName}' not found; skipping.", request.CharacterName);
+        return Results.Ok(new { registered = 0, skipped = true, reason = "Character not in canonical database" });
+    }
+
+    DateTime now = DateTime.UtcNow;
+    string assetPath = $"Characters/Dialogue/{request.CharacterName}";
+    List<DialogueSource> sources = request.Entries
+        .Where(kv => !string.IsNullOrWhiteSpace(kv.Value))
+        .Select(kv => new DialogueSource
+        {
+            CanonicalCharacterId = canonical.Id,
+            SourceModId = "StardewValley.Vanilla",
+            FilePath = assetPath,
+            AssetName = assetPath,
+            DialogueKey = kv.Key,
+            RawText = kv.Value,
+            Season = InferVanillaSeason(kv.Key),
+            HeartLevel = InferVanillaHeartLevel(kv.Key),
+            RelationshipState = InferVanillaRelationship(kv.Key),
+            SourcePriority = InferVanillaPriority(kv.Key),
+            IsActive = true,
+            LastSeen = now,
+            SourceRootPath = null   // not from Mods folder; path filter keeps null rows
+        })
+        .ToList();
+
+    await dialogueSourceRepo.UpsertRangeAsync(sources);
+    logger.LogInformation("[VanillaDialogue] Registered {Count} line(s) for '{CharacterName}' (canonical id={CanonicalId}).",
+        sources.Count, request.CharacterName, canonical.Id);
+    return Results.Ok(new { registered = sources.Count });
 });
 
 app.MapPost("/api/dialogue-sources/scan", async (DialogueSourceScannerService scanner, LivingLoreWebOptions webOptions) =>
@@ -765,17 +835,27 @@ static async Task<IResult> GenerateDialogue(
     if (isSmapiRequest && request.SaveContext is SaveFileContextSnapshot sc)
     {
         saveContextOverride = sc;
-        logger.LogInformation("Using SMAPI save context: saveFileName={SaveFileName}, playerName={PlayerName}, farmName={FarmName}, location={Location}.",
-            sc.SaveFileName, sc.PlayerName, sc.FarmName, sc.Location);
+        logger.LogInformation(
+            "[SMAPI] Save context received: saveFileName={SaveFileName}, playerName={PlayerName}, farmName={FarmName}, location={Location}, season={Season}, day={Day}, year={Year}.",
+            sc.SaveFileName ?? "(none)", sc.PlayerName, sc.FarmName, sc.Location, sc.Season, sc.Day, sc.Year);
         if (sc.PlayerName is "Unknown" or "")
-            logger.LogWarning("SMAPI save context has Unknown playerName — live game state may not be available.");
+            logger.LogWarning("[SMAPI] Save context has Unknown playerName — live game state may not be available.");
         if (sc.FarmName is "Unknown" or "")
-            logger.LogWarning("SMAPI save context has Unknown farmName — live game state may not be available.");
+            logger.LogWarning("[SMAPI] Save context has Unknown farmName — live game state may not be available.");
+        if (string.IsNullOrWhiteSpace(sc.SaveFileName))
+            logger.LogWarning("[SMAPI] Save context is missing saveFileName — save-file profile mapping will be skipped.");
     }
     else if (isSmapiRequest)
     {
-        logger.LogWarning("SMAPI request did not include a save context; falling back to defaults.");
+        logger.LogWarning("[SMAPI] Request did not include a save context; falling back to defaults.");
     }
+
+    // ActivePlayerProfileId (from SMAPI hint or future use) falls back to explicit PlayerProfileId.
+    long? resolvedProfileId = request.PlayerProfileId ?? request.ActivePlayerProfileId;
+    if (resolvedProfileId is not null)
+        logger.LogInformation("[SMAPI] Explicit player profile id hint received: {ProfileId}.", resolvedProfileId);
+    else
+        logger.LogInformation("[SMAPI] No explicit player profile id; server will auto-resolve from save context (saveFileName / playerName+farmName / globally active).");
 
     string rawLocation = FirstNonEmpty(request.InternalLocationId, request.LocationName, request.Location);
     DialogueContext context = new()
@@ -800,14 +880,22 @@ static async Task<IResult> GenerateDialogue(
 
     try
     {
-        GeneratedDialogueResult result = await service.GenerateAsync(context, request.RelationshipContext, saveContextOverride, request.PlayerProfileId);
+        GeneratedDialogueResult result = await service.GenerateAsync(context, request.RelationshipContext, saveContextOverride, resolvedProfileId);
         logger.LogInformation("[LivingLore] Resolved Character: {ResolvedCharacter}", result.ResolvedCharacterName);
         logger.LogInformation("[LivingLore] Resolved Display Location: {DisplayLocation}", result.DisplayLocation);
+        bool profileResolved = !string.IsNullOrWhiteSpace(result.ActivePlayerProfileName);
         logger.LogInformation(
-            "Player profile resolution: found={Found}, profileName={ProfileName}, matchMethod={MatchMethod}.",
-            !string.IsNullOrWhiteSpace(result.ActivePlayerProfileName),
-            string.IsNullOrWhiteSpace(result.ActivePlayerProfileName) ? "(none)" : result.ActivePlayerProfileName,
+            "[ProfileResolution] Result: profileIncluded={ProfileIncluded}, profileName={ProfileName}, matchMethod={MatchMethod}.",
+            profileResolved,
+            profileResolved ? result.ActivePlayerProfileName : "(none)",
             result.PlayerProfileMatchMethod);
+        if (!profileResolved && isSmapiRequest)
+            logger.LogWarning(
+                "[ProfileResolution] No player profile resolved for SMAPI request. " +
+                "Create a profile with farmerName='{PlayerName}' and farmName='{FarmName}', or link saveFile='{SaveFile}' to a profile.",
+                saveContextOverride?.PlayerName ?? "(unknown)",
+                saveContextOverride?.FarmName ?? "(unknown)",
+                saveContextOverride?.SaveFileName ?? "(unknown)");
         if (IsIdentityError(result.Error))
         {
             logger.LogWarning("[LivingLore] WARNING: Character/location mismatch detected.");
@@ -1031,6 +1119,38 @@ static string FirstNonEmpty(params string?[] values)
     return "Unknown";
 }
 
+// Helpers for inferring metadata from vanilla dialogue keys (mirrors DialogueSourceScannerService logic).
+static string? InferVanillaSeason(string key)
+{
+    foreach (string s in new[] { "spring", "summer", "fall", "winter" })
+        if (key.Contains(s, StringComparison.OrdinalIgnoreCase)) return s;
+    return null;
+}
+
+static int? InferVanillaHeartLevel(string key)
+{
+    foreach (int h in new[] { 14, 12, 10, 8, 6, 4, 2 })
+        if (key.Contains($"{h}heart", StringComparison.OrdinalIgnoreCase) || key.Contains($"{h}_heart", StringComparison.OrdinalIgnoreCase))
+            return h;
+    return null;
+}
+
+static string? InferVanillaRelationship(string key)
+{
+    if (key.Contains("marriage", StringComparison.OrdinalIgnoreCase) || key.Contains("spouse", StringComparison.OrdinalIgnoreCase))
+        return "Spouse";
+    if (key.Contains("dating", StringComparison.OrdinalIgnoreCase))
+        return "Dating";
+    return null;
+}
+
+static int InferVanillaPriority(string key)
+{
+    if (key.Contains("marriage", StringComparison.OrdinalIgnoreCase)) return 90;
+    if (key.Contains("heart", StringComparison.OrdinalIgnoreCase)) return 80;
+    return 70;
+}
+
 namespace LivingLoreDialogue.Web
 {
     public sealed class LivingLoreWebOptions
@@ -1054,7 +1174,56 @@ namespace LivingLoreDialogue.Web
     }
 
     public sealed record LoreOverrideRequest(string OverrideType, string FieldName, string OverrideValue, string? Notes);
-    public sealed record MemoryRequest(long CharacterId, string MemoryText, int Importance);
+    public sealed record MemoryRequest(
+        long? CharacterId,
+        string? SaveFileName,
+        string? SaveFilePath,
+        string? PlayerName,
+        string? FarmName,
+        long? PlayerProfileId,
+        string? NpcName,
+        string? MemoryType,
+        string? Title,
+        string? Summary,
+        string? MemoryText,
+        int Importance,
+        string? Season,
+        int Day,
+        int Year,
+        string? Location,
+        string? Source,
+        bool IsActive,
+        string? Tags,
+        string? ReferenceId)
+    {
+        public Memory ToMemory()
+        {
+            string summary = string.IsNullOrWhiteSpace(Summary) ? MemoryText ?? "" : Summary;
+            return new Memory
+            {
+                CharacterId = CharacterId,
+                SaveFileName = SaveFileName,
+                SaveFilePath = SaveFilePath,
+                PlayerName = PlayerName ?? "",
+                FarmName = FarmName ?? "",
+                PlayerProfileId = PlayerProfileId,
+                NpcName = NpcName,
+                MemoryType = string.IsNullOrWhiteSpace(MemoryType) ? "Manual" : MemoryType,
+                Title = Title ?? "",
+                Summary = summary,
+                MemoryText = summary,
+                Importance = Importance,
+                Season = Season ?? "",
+                Day = Day,
+                Year = Year,
+                Location = Location ?? "",
+                Source = string.IsNullOrWhiteSpace(Source) ? "Manual" : Source,
+                IsActive = IsActive,
+                Tags = Tags ?? "",
+                ReferenceId = ReferenceId ?? ""
+            };
+        }
+    }
     public sealed record RelationshipRequest(long CharacterA, long CharacterB, string RelationshipType, int Strength);
     public sealed record DialogueTestRequest(
         string CharacterName,
@@ -1070,6 +1239,7 @@ namespace LivingLoreDialogue.Web
         int FriendshipLevel,
         string? RelationshipContext,
         long? PlayerProfileId = null,
+        long? ActivePlayerProfileId = null,
         string? RequestSource = null,
         SaveFileContextSnapshot? SaveContext = null);
     public sealed record SettingsRequest(string OpenAiModel, string? GamePath, string ModsFolderPath, bool EnableLiveInGameDialogueGeneration);
@@ -1099,6 +1269,7 @@ namespace LivingLoreDialogue.Web
         string? CustomNotes);
     public sealed record PlayerProfileMemoryRequest(long? CanonicalCharacterId, string MemoryText, int Importance);
     public sealed record SaveLinkRequest(string SaveFileName, string? SaveFilePath, bool IsDefaultForSave);
+    public sealed record VanillaDialogueRequest(string CharacterName, IReadOnlyDictionary<string, string> Entries);
     public sealed record ScenarioRequest(
         string Name,
         string PlayerName,

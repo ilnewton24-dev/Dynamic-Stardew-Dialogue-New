@@ -69,15 +69,13 @@ public sealed class DialogueManager
             Character = character,
             Relationships = await this.relationshipRepository.GetForCharacterAsync(character.Id),
             Events = await this.eventRepository.GetRecentAsync(),
-            Memories = await this.memoryRepository.GetRecentForCharacterAsync(character.Id, this.maxRecentMemories),
+            Memories = Array.Empty<Memory>(),
             VoiceRules = await this.voiceRuleRepository.GetForCharacterAsync(character.Id),
             UserOverrides = await this.userLoreOverrideRepository.GetForCharacterAsync(character.Id),
             RecentChanges = await this.loreChangeLogRepository.GetRecentForCharacterAsync(character.Id, 8)
         };
 
         GeneratedDialogue dialogue = await this.openAiDialogueService.GenerateDialogueAsync(context, lore);
-        await this.memoryRepository.AddAsync(character.Id, $"Conversation about {dialogue.Topic}: {dialogue.Dialogue}", 2);
-
         this.cache[cacheKey] = new CacheEntry(dialogue, DateTime.UtcNow.Add(this.cacheDuration));
         return dialogue;
     }

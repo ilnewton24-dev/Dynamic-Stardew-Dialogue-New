@@ -43,9 +43,24 @@ public sealed class DialogueExplanationService
         var memories = lore.Memories.Select(memory => new
         {
             memory.Id,
+            memory.SaveFileName,
+            memory.PlayerProfileId,
+            memory.NpcName,
+            memory.MemoryType,
+            memory.Title,
+            memory.Summary,
             memory.MemoryText,
             memory.Importance,
-            memory.CreatedDate
+            memory.Season,
+            memory.Day,
+            memory.Year,
+            memory.Location,
+            memory.Source,
+            memory.CreatedDate,
+            memory.CreatedAt,
+            memory.LastSeenAt,
+            memory.IsActive,
+            memory.Tags
         });
 
         var relationships = lore.Relationships.Select(relationship => new
@@ -74,12 +89,17 @@ public sealed class DialogueExplanationService
             text = source.RawText
         });
 
-        var sourceMods = lore.CharacterSources.Select(source => new
+        // Use the full set (including inactive historical sources) so the explanation page can show
+        // which mods were present in the database and whether each was included in or excluded from
+        // the prompt. isActive=false means the mod is no longer installed / was deactivated.
+        var sourceMods = lore.CharacterSourcesAll.Select(source => new
         {
             mod = source.SourceModId,
             type = source.SourceType,
             source.Priority,
-            source.Notes
+            source.Notes,
+            isActive = source.IsActive,
+            includedInPrompt = source.IsActive
         });
 
         object? playerProfile = lore.PlayerProfile is null ? null : new
