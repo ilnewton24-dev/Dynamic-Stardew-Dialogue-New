@@ -1,0 +1,55 @@
+@page
+<section class="page">
+    <h2 id="profile-detail-title">Player Profile</h2>
+    <p class="page-intro"><a href="/PlayerProfiles">&larr; Back to all profiles</a></p>
+
+    <div class="card span-12" id="profile-summary"></div>
+
+    <div class="columns">
+        <section class="panel">
+            <h3>Relationship Notes</h3>
+            <p>Per-character notes (e.g. "Lance: married, playful rivalry, trusts him completely").</p>
+            <form id="profile-relationship-form">
+                <label>Character <select name="canonicalCharacterId" id="rel-character" required></select></label>
+                <label>Relationship Type <input name="relationshipType" placeholder="married, rival, friend..." required></label>
+                <label>Description <textarea name="relationshipDescription"></textarea></label>
+                <label>Strength (0-100) <input name="relationshipStrength" type="number" min="0" max="100" value="50"></label>
+                <label>Custom Notes <textarea name="customNotes"></textarea></label>
+                <button type="submit">Add Relationship Note</button>
+                <span id="rel-status" class="status"></span>
+            </form>
+            <table id="profile-relationships"></table>
+        </section>
+
+        <section class="panel">
+            <h3>Player Memories</h3>
+            <p>Memories tied to this player (e.g. "Player married Lance in Year 2").</p>
+            <form id="profile-memory-form">
+                <label>Character (optional) <select name="canonicalCharacterId" id="mem-character"><option value="">General memory</option></select></label>
+                <label>Memory <textarea name="memoryText" required></textarea></label>
+                <label>Importance (1-5) <input name="importance" type="number" min="1" max="5" value="3"></label>
+                <button type="submit">Add Memory</button>
+                <span id="mem-status" class="status"></span>
+            </form>
+            <table id="profile-memories"></table>
+        </section>
+    </div>
+
+    <section class="panel">
+        <h3>Save File Linking</h3>
+        <form id="profile-savelink-form">
+            <label>Save File Name <input name="saveFileName" required></label>
+            <label>Save File Path (optional) <input name="saveFilePath"></label>
+            <label class="checkbox"><input name="isDefaultForSave" type="checkbox"> Default profile for this save</label>
+            <button type="submit">Link Save</button>
+            <span id="savelink-status" class="status"></span>
+        </form>
+        <table id="profile-savelinks"></table>
+    </section>
+</section>
+
+@section Scripts {
+<script>
+loadPlayerProfileDetailPage();
+</script>
+}

@@ -1,0 +1,19 @@
+@page
+<section>
+    <h2>Characters</h2>
+    <div class="toolbar">
+        <button id="clear-characters" class="danger">Clear All Characters</button>
+        <label class="checkbox"><input type="checkbox" id="characters-include-inactive"> Show historical (inactive)</label>
+        <span id="characters-count" class="status"></span>
+        <span id="clear-result" class="status"></span>
+    </div>
+    <table id="characters"></table>
+</section>
+
+@section Scripts {
+<script>
+loadCharacters();
+bindClearCharacters();
+document.getElementById("characters-include-inactive").addEventListener("change", loadCharacters);
+</script>
+}

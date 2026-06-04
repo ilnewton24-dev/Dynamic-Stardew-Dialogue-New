@@ -1,0 +1,14 @@
+@page
+<section>
+    <h2>Dialogue Override Review</h2>
+    <button id="export-overrides">Export Content Patcher Overrides</button>
+    <p id="export-result" class="status"></p>
+    <table id="dialogue-overrides"></table>
+</section>
+
+@section Scripts {
+<script>
+loadDialogueOverrides();
+bindDialogueExport();
+</script>
+}

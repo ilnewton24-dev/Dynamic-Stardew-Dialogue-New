@@ -1,0 +1,21 @@
+@page
+<section>
+    <h2>Settings</h2>
+    <form id="settings-form">
+        <label>Database path <input name="databasePath" disabled></label>
+        <label>OpenAI API key environment variable <input name="openAiApiKeyEnvironmentVariable" disabled></label>
+        <label>API key available <input name="hasOpenAiApiKey" disabled></label>
+        <label>Model name <select name="openAiModel" id="settings-model-select" required></select></label>
+        <label>Stardew Valley game path <input name="gamePath"></label>
+        <label>Mods folder path <input name="modsFolderPath"></label>
+        <label class="checkbox"><input name="enableLiveInGameDialogueGeneration" type="checkbox"> Live in-game generation enabled</label>
+        <button type="submit">Save Settings</button>
+    </form>
+</section>
+
+@section Scripts {
+<script>
+loadSettings();
+bindSettingsForm();
+</script>
+}

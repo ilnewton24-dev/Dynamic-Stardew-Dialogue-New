@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>LivingLoreDialogue</AssemblyName>
+    <RootNamespace>LivingLoreDialogue</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Pathoschild.Stardew.ModBuildConfig" Version="4.4.0" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.8" />
+  </ItemGroup>
+
+  <!-- The dashboard (LivingLoreDialogue.Web) is a separate ASP.NET project. Keep its sources and
+       assets out of the SMAPI mod build; they are published separately by package-local-mod.ps1. -->
+  <ItemGroup>
+    <Compile Remove="LivingLoreDialogue.Web\**\*.cs" />
+    <Content Remove="LivingLoreDialogue.Web\**" />
+    <None Remove="LivingLoreDialogue.Web\**" />
+    <EmbeddedResource Remove="LivingLoreDialogue.Web\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="manifest.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="config.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Data\schema.sql" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Data\seed.sql" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

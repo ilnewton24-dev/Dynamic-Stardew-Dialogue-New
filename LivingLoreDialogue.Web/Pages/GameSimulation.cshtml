@@ -1,0 +1,62 @@
+@page
+<section class="page">
+    <h2>Game Simulation Mode</h2>
+    <p class="page-intro">Test dialogue generation, save-context handling, and override generation without launching Stardew Valley.</p>
+
+    <div class="simulation-cards">
+        <div class="card"><h3>Player Card</h3><p id="sim-player-card">Choose a scenario to inspect player state.</p></div>
+        <div class="card"><h3>Farm Card</h3><p id="sim-farm-card">Farm, season, weather, and year appear here.</p></div>
+        <div class="card"><h3>Relationship Card</h3><p id="sim-relationship-card">Relationship state and hearts appear here.</p></div>
+    </div>
+
+    <div class="columns">
+        <section class="panel">
+            <h3>Character Interaction Simulator</h3>
+            <form id="simulate-form">
+                <label>Character <select name="characterName" id="simulate-character" required></select></label>
+                <label>Scenario <select name="scenarioId" id="simulate-scenario" required></select></label>
+                <label>Topic <input name="topic" value="general" required></label>
+                <button type="submit">Run Simulation</button>
+                <span id="simulate-status" class="status"></span>
+            </form>
+        </section>
+
+        <section class="panel">
+            <h3>Scenario Editor</h3>
+            <form id="scenario-form">
+                <input type="hidden" name="id">
+                <label>Scenario <select id="scenario-picker"></select></label>
+                <label>Name <input name="name" required></label>
+                <label>Player Name <input name="playerName" required></label>
+                <label>Farm Name <input name="farmName" required></label>
+                <label>Year <input name="year" type="number" min="1" value="1" required></label>
+                <label>Season <input name="season" value="spring" required></label>
+                <label>Weather <input name="weather" value="clear" required></label>
+                <label>Location <input name="location" value="Town" required></label>
+                <label>Friendship Hearts <input name="friendshipHearts" type="number" min="0" max="14" value="0" required></label>
+                <label>Relationship State <input name="relationshipState" value="Stranger" required></label>
+                <label>Seen Events (one per line) <textarea name="seenEvents"></textarea></label>
+                <label>Completed Quests (one per line) <textarea name="completedQuests"></textarea></label>
+                <label>Community Center State <input name="communityCenterState" value="Not started" required></label>
+                <label>Player Profile <select name="playerProfileId" id="scenario-profile"></select></label>
+                <div class="action-row">
+                    <button type="button" id="scenario-new">New</button>
+                    <button type="submit">Save Scenario</button>
+                    <button type="button" id="scenario-delete" class="danger">Delete</button>
+                </div>
+                <span id="scenario-status" class="status"></span>
+            </form>
+        </section>
+    </div>
+
+    <section class="output" id="simulation-report" hidden>
+        <h3>Test Report</h3>
+        <div id="report-body"></div>
+    </section>
+</section>
+
+@section Scripts {
+<script>
+loadGameSimulationPage();
+</script>
+}

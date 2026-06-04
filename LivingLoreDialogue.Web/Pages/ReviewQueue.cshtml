@@ -1,0 +1,23 @@
+@page
+<section>
+    <h2>Character Review Queue</h2>
+    <p>Discovered candidates scored on a 0-100 confidence scale. Confirmed (80-100) and Probable
+       (50-79) candidates are imported as characters; Rejected candidates (below 50) are held here
+       and never imported automatically.</p>
+    <div id="validation-counts" class="metrics"></div>
+
+    <h3>Confirmed Characters (80-100)</h3>
+    <table id="validation-confirmed"></table>
+
+    <h3>Probable Characters (50-79)</h3>
+    <table id="validation-probable"></table>
+
+    <h3>Rejected Candidates (below 50)</h3>
+    <table id="validation-rejected"></table>
+</section>
+
+@section Scripts {
+<script>
+loadValidation();
+</script>
+}

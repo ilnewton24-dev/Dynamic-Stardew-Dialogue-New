@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>living-lore-dialogue-web-local</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Data\*.cs" LinkBase="Data" />
+    <Compile Include="..\Models\*.cs" LinkBase="Models" />
+    <Compile Include="..\Repositories\*.cs" LinkBase="Repositories" />
+    <Compile Include="..\Services\CharacterSyncService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\CharacterValidationService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\DashboardHealthService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\DialogueExplanationService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\DialogueContextBuilderService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\DialogueContextSelectionService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\DialogueExportService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\DialogueGenerationService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\DialogueQualityService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\DialogueSourceScannerService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\GameSimulationService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\ModScannerService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\ModScanCoordinator.cs" LinkBase="Services" />
+    <Compile Include="..\Services\OpenAiDialogueService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\PromptBuilder.cs" LinkBase="Services" />
+    <Compile Include="..\Services\SaveFileContextService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\VanillaCharacterScannerService.cs" LinkBase="Services" />
+  </ItemGroup>
+</Project>

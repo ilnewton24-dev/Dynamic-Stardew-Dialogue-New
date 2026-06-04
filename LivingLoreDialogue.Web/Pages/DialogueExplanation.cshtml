@@ -1,0 +1,27 @@
+@page
+<section class="page">
+    <h2>Dialogue Explanation</h2>
+    <p class="page-intro">Audit the full generation path: source dialogue, memories, relationships, save context, prompt builder, model call, and returned line.</p>
+
+    <div class="codex-grid">
+        <section class="panel">
+            <h3>Recent Generated Dialogue</h3>
+            <table id="explain-history"></table>
+        </section>
+        <section class="panel">
+            <h3 id="explain-detail-title">Explanation</h3>
+            <div id="explain-detail">
+                <div class="empty-state">
+                    <div class="empty-icon">EX</div>
+                    <p>Select a generated line to inspect its full trace.</p>
+                </div>
+            </div>
+        </section>
+    </div>
+</section>
+
+@section Scripts {
+<script>
+loadDialogueExplanationPage();
+</script>
+}

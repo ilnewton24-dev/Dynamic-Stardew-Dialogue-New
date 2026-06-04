@@ -1,0 +1,47 @@
+@page
+<section class="page">
+    <h2>Dialogue Test</h2>
+    <p class="page-intro">Generate a local test line using scanned lore, save context, relationship state, and quality scoring.</p>
+    <div class="dialogue-test-layout">
+        <form id="dialogue-test-form" class="panel">
+            <h3>Scene Controls</h3>
+            <label>Character <input name="characterName" placeholder="Character name" required></label>
+            <label>Season <input name="season" placeholder="Season" value="spring" required></label>
+            <label>Weather <input name="weather" placeholder="Weather" value="clear" required></label>
+            <label>Location <input name="location" placeholder="Location" value="Town" required></label>
+            <label>Friendship Level <input name="friendshipLevel" type="number" min="0" max="10" value="4" required></label>
+            <label>Relationship <input name="relationshipContext" placeholder="Relationship context"></label>
+            <label>Topic <input name="topic" placeholder="Topic" value="general" required></label>
+            <label>Player Profile <select name="playerProfileId" id="dialogue-profile"></select></label>
+            <button type="submit" class="generate-button">Generate Dialogue</button>
+        </form>
+        <section class="output">
+            <div class="card-header">
+                <h3>Generated Dialogue</h3>
+                <span class="chip">Prompt + Trace Ready</span>
+            </div>
+            <blockquote id="dialogue-output"></blockquote>
+            <h3>Quality Score</h3>
+            <div id="quality-output" class="quality-grid"></div>
+            <details open>
+                <summary>Save Context</summary>
+                <pre id="save-context-output"></pre>
+            </details>
+            <details>
+                <summary>Prompt Preview</summary>
+                <pre id="prompt-output"></pre>
+            </details>
+            <details id="player-lore-details" hidden>
+                <summary>Player Lore Used</summary>
+                <div id="player-lore-output"></div>
+            </details>
+        </section>
+    </div>
+</section>
+
+@section Scripts {
+<script>
+bindDialogueTestForm();
+loadDialogueTestProfiles();
+</script>
+}

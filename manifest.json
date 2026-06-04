@@ -1,0 +1,10 @@
+{
+  "Name": "Living Lore Dialogue",
+  "Author": "fluff",
+  "Version": "0.1.0",
+  "Description": "Generates lore-consistent NPC dialogue with OpenAI and a local SQLite lore database.",
+  "UniqueID": "fluff.LivingLoreDialogue",
+  "EntryDll": "LivingLoreDialogue.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}

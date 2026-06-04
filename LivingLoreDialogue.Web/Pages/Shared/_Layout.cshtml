@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Living Lore Dialogue</title>
+    <link rel="stylesheet" href="/css/site.css">
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="sidebar" id="sidebar">
+            <div class="brand">
+                <div class="brand-mark">LL</div>
+                <div class="brand-copy">
+                    <strong>Living Lore</strong>
+                    <span>Dialogue command center</span>
+                </div>
+            </div>
+            <button type="button" class="sidebar-toggle" id="sidebar-toggle" title="Collapse sidebar" aria-label="Collapse sidebar">=</button>
+            <nav class="side-nav" aria-label="Primary navigation">
+                <a href="/" data-route="/" data-icon="DB"><span>Dashboard</span></a>
+                <a href="/Characters" data-route="/Characters" data-icon="CH"><span>Characters</span></a>
+                <a href="/Memories" data-route="/Memories" data-icon="ME"><span>Memories</span></a>
+                <a href="/Relationships" data-route="/Relationships" data-icon="RL"><span>Relationships</span></a>
+                <a href="/Mods" data-route="/Mods" data-icon="MD"><span>Mods</span></a>
+                <a href="/MergeReview" data-route="/MergeReview" data-icon="MR"><span>Merge Review</span></a>
+                <a href="/Conflicts" data-route="/Conflicts" data-icon="LC"><span>Lore Conflicts</span></a>
+                <a href="/DialogueTest" data-route="/DialogueTest" data-icon="DT"><span>Dialogue Test</span></a>
+                <a href="/DialogueContext" data-route="/DialogueContext" data-icon="CX"><span>Dialogue Context</span></a>
+                <a href="/DialogueOverrides" data-route="/DialogueOverrides" data-icon="OR"><span>Override Review</span></a>
+                <a href="/DialogueExplanation" data-route="/DialogueExplanation" data-icon="EX"><span>Dialogue Explanation</span></a>
+                <a href="/GameSimulation" data-route="/GameSimulation" data-icon="GS"><span>Game Simulation</span></a>
+                <a href="/PlayerProfiles" data-route="/PlayerProfiles" data-icon="PP"><span>Player Profiles</span></a>
+                <a href="/Settings" data-route="/Settings" data-icon="ST"><span>Settings</span></a>
+            </nav>
+        </aside>
+        <div class="workspace">
+            <header class="topbar">
+                <div>
+                    <p class="eyebrow">Narrative Intelligence Platform</p>
+                    <h1>Living Lore Dialogue</h1>
+                </div>
+                <div class="topbar-status">
+                    <span class="status-dot"></span>
+                    <span>Localhost Only</span>
+                </div>
+            </header>
+            <main>
+                @RenderBody()
+            </main>
+        </div>
+    </div>
+    <script src="/js/site.js"></script>
+    @await RenderSectionAsync("Scripts", required: false)
+</body>
+</html>

@@ -1,0 +1,23 @@
+@page "{id:long}"
+<section class="page character-page">
+    <h2 id="character-title">Character</h2>
+    <div id="character-detail"></div>
+    <section class="panel">
+        <h3>User Lore Override</h3>
+        <form id="override-form">
+            <label>Override Type <input name="overrideType" placeholder="Override type" value="profile" required></label>
+            <label>Field Name <input name="fieldName" placeholder="Field name" required></label>
+            <label>Override Value <textarea name="overrideValue" placeholder="Override value" required></textarea></label>
+            <label>Notes <input name="notes" placeholder="Notes"></label>
+            <button type="submit">Save Override</button>
+        </form>
+    </section>
+</section>
+
+@section Scripts {
+<script>
+const characterId = @RouteData.Values["id"];
+loadCharacterDetail(characterId);
+bindOverrideForm(characterId);
+</script>
+}

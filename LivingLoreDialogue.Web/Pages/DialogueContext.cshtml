@@ -1,0 +1,19 @@
+@page
+<section>
+    <h2>Character Dialogue Context</h2>
+    <form id="dialogue-context-form">
+        <select name="canonicalId" id="dialogue-context-character"></select>
+        <button type="submit">Load Context</button>
+    </form>
+    <section>
+        <h3>Tone Summary</h3>
+        <pre id="dialogue-context-summary"></pre>
+    </section>
+    <table id="dialogue-context-sources"></table>
+</section>
+
+@section Scripts {
+<script>
+loadDialogueContextPage();
+</script>
+}

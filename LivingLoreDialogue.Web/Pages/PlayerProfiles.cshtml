@@ -1,0 +1,45 @@
+@page
+<section class="page">
+    <h2>Player Profiles</h2>
+    <p class="page-intro">Create farmer/player lore profiles for your different saves. The active profile (or the one
+       linked to the current save) is woven into dialogue generation so NPCs reference your player's lore.</p>
+
+    <div class="columns">
+        <section class="panel">
+            <h3>Profiles</h3>
+            <table id="player-profiles"></table>
+        </section>
+
+        <section class="panel">
+            <h3 id="profile-form-title">Create Player Profile</h3>
+            <form id="profile-form">
+                <input type="hidden" name="id">
+                <label>Profile Name <input name="profileName" required></label>
+                <label>Farmer Name <input name="farmerName" required></label>
+                <label>Farm Name <input name="farmName" required></label>
+                <label>Linked Save File <input name="saveFileName" placeholder="e.g. Rhea_123456789"></label>
+                <label>Description <textarea name="description"></textarea></label>
+                <label>Backstory <textarea name="backstory"></textarea></label>
+                <label>Personality <textarea name="personality"></textarea></label>
+                <label>Roleplay Style <textarea name="roleplayStyle"></textarea></label>
+                <label>Preferred Dialogue Tone <input name="preferredTone"></label>
+                <label>Important History <textarea name="importantHistory"></textarea></label>
+                <label>Current Goals <textarea name="currentGoals"></textarea></label>
+                <label>Relationship Notes <textarea name="relationshipNotes"></textarea></label>
+                <label>Custom Lore <textarea name="customLore"></textarea></label>
+                <input type="hidden" name="saveFilePath">
+                <div class="action-row">
+                    <button type="button" id="profile-new" class="secondary">New</button>
+                    <button type="submit">Save Profile</button>
+                </div>
+                <span id="profile-status" class="status"></span>
+            </form>
+        </section>
+    </div>
+</section>
+
+@section Scripts {
+<script>
+loadPlayerProfilesPage();
+</script>
+}

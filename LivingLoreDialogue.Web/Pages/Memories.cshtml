@@ -1,0 +1,19 @@
+@page
+<section>
+    <h2>Memories</h2>
+    <form id="memory-form">
+        <input name="id" type="hidden">
+        <input name="characterId" type="number" placeholder="Character ID" required>
+        <input name="importance" type="number" min="1" max="5" value="3" required>
+        <textarea name="memoryText" placeholder="Memory text" required></textarea>
+        <button type="submit">Save Memory</button>
+    </form>
+    <table id="memories"></table>
+</section>
+
+@section Scripts {
+<script>
+loadMemories();
+bindMemoryForm();
+</script>
+}

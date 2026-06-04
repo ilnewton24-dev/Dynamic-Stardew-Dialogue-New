@@ -1,0 +1,20 @@
+{
+  "OpenAiApiKeyEnvironmentVariable": "OPENAI_API_KEY",
+  "OpenAiModel": "gpt-4.1-mini",
+  "DialogueCacheMinutes": 30,
+  "MaxRecentMemories": 8,
+  "EnableSeedDataOnFirstRun": true,
+  "EnableDynamicModScanning": true,
+  "GamePath": "",
+  "ModsFolderPath": "",
+  "EnableLiveInGameDialogueGeneration": true,
+  "OverrideNpcDialogue": true,
+  "UseLocalWebApiForDialogue": true,
+  "LocalWebApiBaseUrl": "http://localhost:5077",
+  "DebugLogging": true,
+  "EnableLocalDashboardAutoStart": true,
+  "LocalDashboardPort": 5077,
+  "LocalDashboardRelativePath": "Dashboard/LivingLoreDialogue.Web.exe",
+  "DashboardStartupTimeoutSeconds": 60,
+  "OpenDashboardBrowserOnLaunch": false
+}

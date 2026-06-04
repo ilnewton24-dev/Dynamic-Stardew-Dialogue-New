@@ -1,0 +1,10 @@
+bin/
+obj/
+*.user
+*.suo
+living_lore.db
+ValleyLedger.db
+*.zip
+
+# Local secrets — never commit a real API key
+openai-api-key.txt

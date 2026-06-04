@@ -1,0 +1,29 @@
+@page
+<section>
+    <h2>Mods</h2>
+    <button id="scan-mods">Scan Game Files</button>
+    <p id="scan-result"></p>
+    <div class="metrics" id="mod-scan-status"></div>
+    <section>
+        <h3>Latest Scan Summary</h3>
+        <pre id="latest-scan-summary"></pre>
+    </section>
+    <section>
+        <h3>Recent Scan History</h3>
+        <table id="scan-history"></table>
+    </section>
+    <div class="toolbar">
+        <label class="checkbox"><input type="checkbox" id="mods-include-inactive"> Show historical (inactive)</label>
+        <span id="mods-count" class="status"></span>
+    </div>
+    <table id="mods"></table>
+</section>
+
+@section Scripts {
+<script>
+loadModStatus();
+loadMods();
+bindModScan();
+document.getElementById("mods-include-inactive").addEventListener("change", loadMods);
+</script>
+}

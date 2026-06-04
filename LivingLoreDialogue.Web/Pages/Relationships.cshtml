@@ -1,0 +1,27 @@
+@page
+<section>
+    <h2>Relationships</h2>
+    <form id="relationship-form">
+        <input name="id" type="hidden">
+        <input name="characterA" type="number" placeholder="Character A ID" required>
+        <input name="characterB" type="number" placeholder="Character B ID" required>
+        <select name="relationshipType">
+            <option>friend</option>
+            <option>spouse</option>
+            <option>rival</option>
+            <option>distrusts</option>
+            <option>colleague</option>
+            <option>enemy</option>
+        </select>
+        <input name="strength" type="number" min="-100" max="100" value="25" required>
+        <button type="submit">Save Relationship</button>
+    </form>
+    <table id="relationships"></table>
+</section>
+
+@section Scripts {
+<script>
+loadRelationships();
+bindRelationshipForm();
+</script>
+}

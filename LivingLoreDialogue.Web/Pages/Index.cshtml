@@ -1,0 +1,51 @@
+@page
+<section class="page">
+    <h2>Dashboard</h2>
+    <p class="page-intro">Monitor the local lore database, generation pipeline, scan history, and narrative activity across your installed Stardew mods.</p>
+
+    <div class="dashboard-grid">
+        <section class="card span-6" id="openai-panel">
+            <div class="card-header">
+                <h3>OpenAI Connection</h3>
+                <span class="chip">Model Control</span>
+            </div>
+            <div class="metrics" id="openai-status"></div>
+            <div class="action-row">
+                <label for="openai-model-select">Model</label>
+                <select id="openai-model-select"></select>
+                <button id="openai-model-apply" class="secondary">Apply</button>
+                <button id="openai-recheck" class="secondary">Re-check</button>
+                <span id="openai-model-result" class="status"></span>
+            </div>
+        </section>
+
+        <section class="span-6">
+            <div class="metrics" id="metrics"></div>
+        </section>
+
+        <section class="card span-6">
+            <h3>Recent Generated Dialogue</h3>
+            <div id="dialogue-cards" class="dialogue-list"></div>
+        </section>
+
+        <section class="card span-6">
+            <h3>Operational Snapshot</h3>
+            <div id="dashboard-charts" class="chart-bars"></div>
+        </section>
+
+        <section class="card span-12">
+            <div class="panel-header">
+                <h3>Activity Timeline</h3>
+                <span class="chip">Recent Lore Changes</span>
+            </div>
+            <table id="changes"></table>
+        </section>
+    </div>
+</section>
+
+@section Scripts {
+<script>
+loadDashboard();
+loadOpenAiPanel();
+</script>
+}
