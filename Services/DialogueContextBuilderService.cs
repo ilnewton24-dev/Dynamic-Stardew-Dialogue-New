@@ -88,9 +88,9 @@ public sealed class DialogueContextBuilderService
         SaveFileContextSnapshot saveContext = saveContextOverride
             ?? await this.saveFileContextService.GetSnapshotAsync(context, relationshipContext);
 
-        // Resolve the player profile by priority: explicit selection, then save-file link,
-        // then the active/default profile. Missing profiles never fail generation.
-        (PlayerProfile? playerProfile, string? playerSaveLink) = await this.ResolvePlayerProfileAsync(playerProfileId, saveContext);
+        // Resolve the player profile by priority. Missing profiles never fail generation.
+        PlayerProfileResolution playerProfileResolution = await this.ResolvePlayerProfileAsync(playerProfileId, saveContext, context.RequestSource);
+        PlayerProfile? playerProfile = playerProfileResolution.Profile;
         IReadOnlyList<PlayerProfileRelationship> playerRelationships = Array.Empty<PlayerProfileRelationship>();
         IReadOnlyList<PlayerProfileMemory> playerMemories = Array.Empty<PlayerProfileMemory>();
         if (playerProfile is not null)
@@ -145,7 +145,8 @@ public sealed class DialogueContextBuilderService
             PlayerProfile = playerProfile,
             PlayerRelationships = playerRelationships,
             PlayerMemories = playerMemories,
-            PlayerProfileSaveLink = playerSaveLink
+            PlayerProfileSaveLink = playerProfileResolution.SaveLink,
+            PlayerProfileMatchMethod = playerProfileResolution.MatchMethod
         };
 
         return new DialogueContextPacket
@@ -158,22 +159,43 @@ public sealed class DialogueContextBuilderService
         };
     }
 
-    private async Task<(PlayerProfile? Profile, string? SaveLink)> ResolvePlayerProfileAsync(long? playerProfileId, SaveFileContextSnapshot saveContext)
+    private async Task<PlayerProfileResolution> ResolvePlayerProfileAsync(long? playerProfileId, SaveFileContextSnapshot saveContext, string? requestSource)
     {
         // 1. Explicit selection (Dialogue Test / Simulation dropdown).
         if (playerProfileId is long id)
-            return (await this.playerProfileRepository.GetByIdAsync(id), null);
+        {
+            PlayerProfile? explicitProfile = await this.playerProfileRepository.GetByIdAsync(id);
+            return explicitProfile is null
+                ? PlayerProfileResolution.None
+                : new PlayerProfileResolution(explicitProfile, null, "explicit selection");
+        }
 
         // 2. Save-file link (auto-detected current save).
         if (!string.IsNullOrWhiteSpace(saveContext.SaveFileName))
         {
             PlayerProfile? linked = await this.playerProfileRepository.GetBySaveFileAsync(saveContext.SaveFileName!);
             if (linked is not null)
-                return (linked, saveContext.SaveFileName);
+                return new PlayerProfileResolution(linked, saveContext.SaveFileName, "save mapping");
         }
 
-        // 3. Active/default profile, or none.
-        return (await this.playerProfileRepository.GetActiveAsync(), null);
+        bool isSmapiRequest = requestSource?.Contains("SMAPI", StringComparison.OrdinalIgnoreCase) == true;
+
+        // 3. SMAPI requests prefer the manually active dashboard profile, so profile switching
+        // is immediate even when several saves share the same farmer/farm names.
+        PlayerProfile? active = await this.playerProfileRepository.GetActiveAsync();
+        if (isSmapiRequest && active is not null)
+            return new PlayerProfileResolution(active, null, "manually active profile");
+
+        // 4. Match the live save identity to an active profile.
+        PlayerProfile? matched = await this.playerProfileRepository.GetByFarmerAndFarmAsync(saveContext.PlayerName, saveContext.FarmName);
+        if (matched is not null)
+            return new PlayerProfileResolution(matched, null, "playerName + farmName");
+
+        // 5. Dashboard/simulation fallback to the active/default profile, or none.
+        if (active is not null)
+            return new PlayerProfileResolution(active, null, "manually active profile");
+
+        return PlayerProfileResolution.None;
     }
 
     private static Character? ChooseProfileCharacter(
@@ -204,5 +226,10 @@ public sealed class DialogueContextBuilderService
         foreach (Character instance in instances)
             results.AddRange(await load(instance));
         return results;
+    }
+
+    private sealed record PlayerProfileResolution(PlayerProfile? Profile, string? SaveLink, string MatchMethod)
+    {
+        public static PlayerProfileResolution None { get; } = new(null, null, "none");
     }
 }

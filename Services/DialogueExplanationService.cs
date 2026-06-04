@@ -88,9 +88,16 @@ public sealed class DialogueExplanationService
             lore.PlayerProfile.ProfileName,
             lore.PlayerProfile.FarmerName,
             lore.PlayerProfile.FarmName,
+            lore.PlayerProfile.SaveFileName,
+            lore.PlayerProfile.Description,
+            lore.PlayerProfile.Backstory,
             lore.PlayerProfile.Personality,
             lore.PlayerProfile.RoleplayStyle,
-            lore.PlayerProfile.PreferredTone
+            lore.PlayerProfile.PreferredTone,
+            lore.PlayerProfile.ImportantHistory,
+            lore.PlayerProfile.CurrentGoals,
+            lore.PlayerProfile.RelationshipNotes,
+            lore.PlayerProfile.CustomLore
         };
 
         var playerRelationships = lore.PlayerRelationships.Select(note => new
@@ -114,6 +121,13 @@ public sealed class DialogueExplanationService
             GeneratedDialogueId = generatedDialogueId,
             GeneratedAt = DateTime.UtcNow,
             CharacterId = lore.Character.Id,
+            InterceptedNpcName = packet.Scene.InterceptedNpcName,
+            CharacterName = packet.Scene.CharacterName,
+            ResolvedCharacterName = packet.Scene.ResolvedCharacterName,
+            LocationName = packet.Scene.DisplayLocation,
+            InternalLocationId = packet.Scene.InternalLocationId,
+            DisplayLocationName = packet.Scene.DisplayLocation,
+            RequestSource = packet.Scene.RequestSource,
             SaveContextSnapshot = JsonSerializer.Serialize(packet.SaveContext, JsonOptions),
             MemoriesUsed = JsonSerializer.Serialize(memories, JsonOptions),
             RelationshipsUsed = JsonSerializer.Serialize(relationships, JsonOptions),
@@ -124,6 +138,7 @@ public sealed class DialogueExplanationService
             PlayerRelationshipNotesUsed = JsonSerializer.Serialize(playerRelationships, JsonOptions),
             PlayerMemoriesUsed = JsonSerializer.Serialize(playerMemories, JsonOptions),
             SaveFileLinkUsed = lore.PlayerProfileSaveLink,
+            PlayerProfileMatchMethod = lore.PlayerProfileMatchMethod,
             PromptVersion = promptVersion,
             PromptText = promptText,
             ModelUsed = modelUsed

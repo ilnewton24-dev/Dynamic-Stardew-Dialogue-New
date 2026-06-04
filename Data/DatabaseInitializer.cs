@@ -34,10 +34,18 @@ public sealed class DatabaseInitializer
         });
         await AddMissingColumnsAsync(connection, "DialogueGenerationTrace", new()
         {
+            ["InterceptedNpcName"] = "TEXT NOT NULL DEFAULT ''",
+            ["CharacterName"] = "TEXT NOT NULL DEFAULT ''",
+            ["ResolvedCharacterName"] = "TEXT NOT NULL DEFAULT ''",
+            ["LocationName"] = "TEXT NOT NULL DEFAULT ''",
+            ["InternalLocationId"] = "TEXT NOT NULL DEFAULT ''",
+            ["DisplayLocationName"] = "TEXT NOT NULL DEFAULT ''",
             ["PlayerProfileUsed"] = "TEXT NOT NULL DEFAULT 'null'",
             ["PlayerRelationshipNotesUsed"] = "TEXT NOT NULL DEFAULT '[]'",
             ["PlayerMemoriesUsed"] = "TEXT NOT NULL DEFAULT '[]'",
-            ["SaveFileLinkUsed"] = "TEXT NULL"
+            ["SaveFileLinkUsed"] = "TEXT NULL",
+            ["PlayerProfileMatchMethod"] = "TEXT NOT NULL DEFAULT 'none'",
+            ["RequestSource"] = "TEXT NOT NULL DEFAULT ''"
         });
         await BackfillCanonicalCharactersAsync(connection);
 

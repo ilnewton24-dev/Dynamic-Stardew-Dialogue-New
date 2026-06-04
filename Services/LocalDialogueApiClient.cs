@@ -28,16 +28,21 @@ public sealed class LocalDialogueApiClient
 
     public async Task<GeneratedDialogueResult?> GenerateAsync(DialogueContext context, string requestSource = "SMAPI")
     {
-        // Include requestSource for diagnostics; the server ignores unknown fields.
         var payload = new
         {
+            context.InterceptedNpcName,
             context.CharacterName,
+            context.DisplayName,
+            context.InternalLocationId,
+            context.DisplayLocation,
+            LocationName = string.IsNullOrWhiteSpace(context.DisplayLocation) ? context.Location : context.DisplayLocation,
             context.Topic,
             context.Season,
             context.Weather,
             context.Location,
             context.FriendshipLevel,
-            RequestSource = requestSource
+            RequestSource = string.IsNullOrWhiteSpace(context.RequestSource) ? requestSource : context.RequestSource,
+            SaveContext = context.SaveContext
         };
 
         string baseUrl = this.httpClient.BaseAddress?.ToString().TrimEnd('/') ?? "(no base url)";

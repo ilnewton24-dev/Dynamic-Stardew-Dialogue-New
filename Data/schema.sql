@@ -298,6 +298,12 @@ CREATE TABLE IF NOT EXISTS DialogueGenerationTrace (
     GeneratedDialogueId INTEGER NOT NULL,
     GeneratedAt TEXT NOT NULL,
     CharacterId INTEGER NOT NULL,
+    InterceptedNpcName TEXT NOT NULL DEFAULT '',
+    CharacterName TEXT NOT NULL DEFAULT '',
+    ResolvedCharacterName TEXT NOT NULL DEFAULT '',
+    LocationName TEXT NOT NULL DEFAULT '',
+    InternalLocationId TEXT NOT NULL DEFAULT '',
+    DisplayLocationName TEXT NOT NULL DEFAULT '',
     SaveContextSnapshot TEXT NOT NULL DEFAULT '{}',
     MemoriesUsed TEXT NOT NULL DEFAULT '[]',
     RelationshipsUsed TEXT NOT NULL DEFAULT '[]',
@@ -310,7 +316,9 @@ CREATE TABLE IF NOT EXISTS DialogueGenerationTrace (
     PlayerProfileUsed TEXT NOT NULL DEFAULT 'null',
     PlayerRelationshipNotesUsed TEXT NOT NULL DEFAULT '[]',
     PlayerMemoriesUsed TEXT NOT NULL DEFAULT '[]',
-    SaveFileLinkUsed TEXT NULL
+    SaveFileLinkUsed TEXT NULL,
+    PlayerProfileMatchMethod TEXT NOT NULL DEFAULT 'none',
+    RequestSource TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS IX_DialogueGenerationTrace_GeneratedDialogueId ON DialogueGenerationTrace(GeneratedDialogueId);

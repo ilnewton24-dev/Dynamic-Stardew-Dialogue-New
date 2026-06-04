@@ -848,10 +848,29 @@ async function showPlayerLoreUsed(historyId) {
 function renderPlayerLoreSections(t) {
     const profile = t.playerProfileUsed;
     if (!profile) return "<p>No player profile used.</p>";
+    const fields = [
+        ["Profile Name", profile.profileName],
+        ["Description", profile.description],
+        ["Backstory", profile.backstory],
+        ["Personality", profile.personality],
+        ["Roleplay Style", profile.roleplayStyle],
+        ["Preferred Dialogue Tone", profile.preferredTone],
+        ["Important History", profile.importantHistory],
+        ["Current Goals", profile.currentGoals],
+        ["Relationship Notes", profile.relationshipNotes],
+        ["Custom Lore", profile.customLore]
+    ].filter(([, value]) => value);
     const rels = (t.playerRelationshipNotesUsed || []).map(r =>
         `<li><strong>${escapeHtml(r.relationshipType)}</strong> (${escapeHtml(r.relationshipStrength)}/100): ${escapeHtml(r.relationshipDescription || "")}${r.customNotes ? ` — ${escapeHtml(r.customNotes)}` : ""}</li>`).join("");
     const mems = (t.playerMemoriesUsed || []).map(m =>
         `<li>[${escapeHtml(m.importance)}]${m.canonicalName ? ` (${escapeHtml(m.canonicalName)})` : ""} ${escapeHtml(m.memoryText)}</li>`).join("");
+    return `
+        <p><strong>Active Player Profile:</strong> ${escapeHtml(profile.profileName)} - farmer ${escapeHtml(profile.farmerName)}, farm ${escapeHtml(profile.farmName)}</p>
+        <p><strong>Profile Match Method:</strong> ${escapeHtml(t.playerProfileMatchMethod || "none")}</p>
+        ${t.saveFileLinkUsed ? `<p><strong>Save File Link Used:</strong> ${escapeHtml(t.saveFileLinkUsed)}</p>` : ""}
+        <p><strong>Profile Fields Used in Prompt:</strong></p>${fields.length ? `<dl class="definition-list">${fields.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`).join("")}</dl>` : "<p>None.</p>"}
+        <p><strong>Player Relationship Notes Used:</strong></p>${rels ? `<ul>${rels}</ul>` : "<p>None.</p>"}
+        <p><strong>Player Memories Used:</strong></p>${mems ? `<ul>${mems}</ul>` : "<p>None.</p>"}`;
     return `
         <p><strong>Player Profile Used:</strong> ${escapeHtml(profile.profileName)} — farmer ${escapeHtml(profile.farmerName)}, farm ${escapeHtml(profile.farmName)}
            ${profile.preferredTone ? `· tone: ${escapeHtml(profile.preferredTone)}` : ""}</p>
@@ -939,11 +958,27 @@ async function loadExplanation(id) {
 
     const sourceMods = (t.sourceModsUsed || []).map(m =>
         `<li>${escapeHtml(m.mod)} <small>(${escapeHtml(m.type)}, priority ${escapeHtml(m.priority)})</small></li>`).join("");
+    const promptPreview = (t.promptText || "").slice(0, 1200);
 
     detail.innerHTML = `
         <div class="workflow">
             ${["Sources", "Context Builder", "Prompt Builder", "OpenAI", "Generated Dialogue"].map(step => `<div class="workflow-step">${step}</div>`).join("")}
         </div>
+        <section class="card">
+            <h4>Identity Debug</h4>
+            <dl class="definition-list">
+                <dt>Request Source</dt><dd>${escapeHtml(t.requestSource || "(unknown)")}</dd>
+                <dt>Intercepted NPC</dt><dd>${escapeHtml(t.interceptedNpcName || "")}</dd>
+                <dt>CharacterName</dt><dd>${escapeHtml(t.characterName || line?.characterName || "")}</dd>
+                <dt>Resolved Character</dt><dd>${escapeHtml(t.resolvedCharacterName || "")}</dd>
+                <dt>Internal Location</dt><dd>${escapeHtml(t.internalLocation || "")}</dd>
+                <dt>Display Location</dt><dd>${escapeHtml(t.displayLocation || t.location || "")}</dd>
+            </dl>
+            <h4>Character Context Used</h4>
+            <pre>${escapeHtml(JSON.stringify({ characterName: t.characterName, resolvedCharacterName: t.resolvedCharacterName, sourceMods: t.sourceModsUsed || [], dialogueSources: t.dialogueSourcesUsed || [] }, null, 2))}</pre>
+            <h4>Prompt Preview</h4>
+            <pre>${escapeHtml(promptPreview)}${(t.promptText || "").length > promptPreview.length ? "\n..." : ""}</pre>
+        </section>
         <section class="card">
             <h4>Generated Dialogue</h4>
             <blockquote>${line ? escapeHtml(line.dialogueText) : "(line not found)"}</blockquote>
@@ -968,7 +1003,20 @@ async function loadExplanation(id) {
         ${relationships ? `<ul>${relationships}</ul>` : "<p>None.</p>"}
 
         <h4>Save Context Used</h4>
-        <pre>${escapeHtml(JSON.stringify(t.saveContext ?? {}, null, 2))}</pre>
+        <p><small><em>Source: ${t.requestSource && t.requestSource.includes('SMAPI') ? '<strong>SMAPI (live game state)</strong>' : 'Dashboard defaults'}</em></small></p>
+        ${t.saveContext ? `<dl class="definition-list">
+            <dt>Player</dt><dd>${escapeHtml(t.saveContext.playerName ?? "Unknown")}</dd>
+            <dt>Farm</dt><dd>${escapeHtml(t.saveContext.farmName ?? "Unknown")}</dd>
+            <dt>Save File</dt><dd>${escapeHtml(t.saveContext.saveFileName ?? "(none)")}</dd>
+            <dt>Spouse</dt><dd>${escapeHtml(t.saveContext.spouse ?? "None")}</dd>
+            <dt>Dating Status</dt><dd>${escapeHtml(t.saveContext.datingStatus ?? "Unknown")}</dd>
+            <dt>Relationship State</dt><dd>${escapeHtml(t.saveContext.relationshipState ?? "Unknown")}</dd>
+            <dt>Friendship Hearts</dt><dd>${escapeHtml(String(t.saveContext.friendshipHearts ?? 0))}</dd>
+            <dt>Has Met NPC</dt><dd>${t.saveContext.hasMetNpc ? "Yes" : "No"}</dd>
+            <dt>Season / Day / Year</dt><dd>${escapeHtml(t.saveContext.season ?? "?")} ${escapeHtml(String(t.saveContext.day ?? 0))}, Year ${escapeHtml(String(t.saveContext.year ?? 0))}</dd>
+            <dt>Community State</dt><dd>${escapeHtml(t.saveContext.communityState ?? "Unknown")}</dd>
+        </dl>` : "<p>No save context stored.</p>"}
+        <details><summary>Raw JSON</summary><pre>${escapeHtml(JSON.stringify(t.saveContext ?? {}, null, 2))}</pre></details>
 
         <h4>Player Lore Used</h4>
         ${renderPlayerLoreSections(t)}
@@ -987,7 +1035,7 @@ async function loadExplanation(id) {
     detail.insertAdjacentHTML("beforeend", `
         <section class="card">
             <h4>Trace Cards</h4>
-            <details open><summary>Context</summary><pre>${escapeHtml(JSON.stringify(t.saveContext ?? {}, null, 2))}</pre></details>
+            <details open><summary>Save Context (${t.requestSource && t.requestSource.includes('SMAPI') ? 'SMAPI live state' : 'dashboard defaults'})</summary><pre>${escapeHtml(JSON.stringify(t.saveContext ?? {}, null, 2))}</pre></details>
             <details><summary>Dialogue Sources</summary>${sources ? `<ul>${sources}</ul>` : "<p>None.</p>"}</details>
             <details><summary>Memories</summary>${memories ? `<ul>${memories}</ul>` : "<p>None.</p>"}</details>
             <details><summary>Relationships</summary>${relationships ? `<ul>${relationships}</ul>` : "<p>None.</p>"}</details>
@@ -1341,6 +1389,12 @@ async function loadPlayerProfilesPage() {
 
 async function refreshPlayerProfilesList() {
     const profiles = await api("/api/player-profiles");
+    const activeProfile = profiles.find(p => p.isActive);
+    const warning = document.getElementById("player-profile-warning");
+    if (warning) {
+        warning.hidden = !!activeProfile;
+        warning.textContent = activeProfile ? "" : "No active player profile selected. SMAPI dialogue will still generate using live save context only.";
+    }
     renderTable("player-profiles", [
         { label: "Profile", render: row => link(`/PlayerProfile?id=${row.id}`, row.profileName) },
         { label: "Farmer", key: "farmerName" },

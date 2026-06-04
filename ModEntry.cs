@@ -285,7 +285,10 @@ public sealed class ModEntry : Mod
 
     private void OnSaveLoaded(object? sender, SaveLoadedEventArgs e)
     {
-        this.Monitor.Log($"[Event] SaveLoaded. Player='{Game1.player?.Name}', location='{Game1.currentLocation?.NameOrUniqueName}'. Living Lore interaction detection is active.", LogLevel.Info);
+        string playerName = SafeGet(() => Game1.player?.Name, "Unknown");
+        string farmName = SafeGet(() => Game1.player?.farmName?.Value, "Unknown");
+        string saveFile = SafeGet(() => Constants.SaveFolderName ?? string.Empty, "(unknown)");
+        this.Monitor.Log($"[Event] SaveLoaded. Player='{playerName}', farm='{farmName}', saveFile='{saveFile}', location='{Game1.currentLocation?.NameOrUniqueName}'. Living Lore interaction detection is active.", LogLevel.Info);
         _ = Task.Run(this.RefreshActiveCharacterCacheAsync); // ensure the eligibility cache reflects the loaded save
     }
 
@@ -506,10 +509,12 @@ public sealed class ModEntry : Mod
     private void RequestGeneratedForHarmony(NPC npc, long requestId)
     {
         string speakerName = npc.Name;
-        DialogueContext context = this.BuildContext(speakerName, "general");
+        DialogueContext context = this.BuildContext(npc, "general", "SMAPI-Harmony");
+        this.LogIdentityContext(context, speakerName);
         _ = Task.Run(async () =>
         {
             GeneratedDialogueResult? result = await this.GenerateResultAsync(context, "SMAPI-Harmony");
+            this.LogResolvedIdentity(result, context);
             string text = ExtractText(result);
             bool usable = result is not null && string.IsNullOrWhiteSpace(result.Error) && !string.IsNullOrWhiteSpace(text);
             this.Monitor.Log($"[Harmony] Generation returned for '{speakerName}' (request #{requestId}, usable={usable}); applying on next update tick.", LogLevel.Info);
@@ -538,9 +543,9 @@ public sealed class ModEntry : Mod
 
                 if (!usable)
                 {
-                    // Task 8: generation failed -> show a graceful fallback line in place of the placeholder.
-                    this.Monitor.Log($"[Harmony] Generation failed/empty for '{speakerName}'; showing fallback line. Error='{result?.Error}'.", LogLevel.Warn);
-                    this.DisplayGeneratedDialogue(npc, $"({npc.displayName ?? speakerName} pauses for a moment.)", replaceOpenBox: true);
+                    this.Monitor.Log($"[Harmony] Generation failed/empty for '{speakerName}'; closing placeholder and leaving generated dialogue blank. Error='{result?.Error}'.", LogLevel.Warn);
+                    if (Game1.activeClickableMenu is DialogueBox)
+                        Game1.exitActiveMenu();
                     return;
                 }
 
@@ -568,7 +573,8 @@ public sealed class ModEntry : Mod
     {
         // Capture the speaker identity with the pending request (tasks 10-12).
         string speakerName = speaker.Name;
-        DialogueContext context = this.BuildContext(speakerName, "general");
+        DialogueContext context = this.BuildContext(speaker, "general", "SMAPI-Dialogue");
+        this.LogIdentityContext(context, speakerName);
 
         _ = Task.Run(async () =>
         {
@@ -582,6 +588,7 @@ public sealed class ModEntry : Mod
             this.Monitor.Log($"[MenuChanged] Speaker '{speakerName}' ACCEPTED as active character; requesting generated dialogue.", LogLevel.Info);
 
             GeneratedDialogueResult? result = await this.GenerateResultAsync(context, "SMAPI-Dialogue");
+            this.LogResolvedIdentity(result, context);
             string text = ExtractText(result);
             bool usable = result is not null && string.IsNullOrWhiteSpace(result.Error) && !string.IsNullOrWhiteSpace(text);
             this.Monitor.Log($"[Display] Generated dialogue QUEUED for speaker '{speakerName}' (usable={usable}); will verify speaker before applying.", LogLevel.Info);
@@ -653,17 +660,184 @@ public sealed class ModEntry : Mod
         this.Monitor.Log($"[Input suppression] Started for {PostDisplaySuppressionMs:0}ms after display.", LogLevel.Info);
     }
 
-    private DialogueContext BuildContext(string characterName, string topic)
+    private DialogueContext BuildContext(NPC npc, string topic, string requestSource = "SMAPI-Harmony")
     {
+        string characterName = npc.Name;
+        SaveFileContextSnapshot saveContext = this.BuildSaveContextSnapshot(characterName);
         return new DialogueContext
         {
             CharacterName = characterName,
+            DisplayName = npc.displayName ?? characterName,
+            InterceptedNpcName = characterName,
             Topic = string.IsNullOrWhiteSpace(topic) ? "general" : topic,
-            Season = SafeGet(() => Game1.currentSeason, "spring"),
-            Weather = SafeGet(GetWeather, "clear"),
-            Location = SafeGet(() => Game1.currentLocation?.NameOrUniqueName, "Unknown"),
-            FriendshipLevel = GetFriendshipLevel(characterName)
+            Season = saveContext.Season,
+            Weather = saveContext.Weather,
+            InternalLocationId = saveContext.Location,
+            Location = saveContext.Location,
+            FriendshipLevel = saveContext.FriendshipHearts,
+            SaveContext = saveContext,
+            RequestSource = requestSource
         };
+    }
+
+    private DialogueContext BuildContext(string characterName, string topic, string requestSource = "SMAPI-Command")
+    {
+        SaveFileContextSnapshot saveContext = this.BuildSaveContextSnapshot(characterName);
+        return new DialogueContext
+        {
+            CharacterName = characterName,
+            DisplayName = characterName,
+            InterceptedNpcName = characterName,
+            Topic = string.IsNullOrWhiteSpace(topic) ? "general" : topic,
+            Season = saveContext.Season,
+            Weather = saveContext.Weather,
+            InternalLocationId = saveContext.Location,
+            Location = saveContext.Location,
+            FriendshipLevel = saveContext.FriendshipHearts,
+            SaveContext = saveContext,
+            RequestSource = requestSource
+        };
+    }
+
+    /// <summary>
+    /// Reads the current live Stardew Valley game state and returns a complete save context snapshot.
+    /// NPC-specific friendship/relationship fields are populated when <paramref name="npcName"/> is provided.
+    /// Returns a minimal fallback snapshot when the world is not ready or Game1.player is null.
+    /// </summary>
+    private SaveFileContextSnapshot BuildSaveContextSnapshot(string? npcName)
+    {
+        if (!Context.IsWorldReady || Game1.player is null)
+        {
+            this.Monitor.Log("[SaveContext] World not ready or player is null; using fallback save context.", LogLevel.Warn);
+            return new SaveFileContextSnapshot();
+        }
+
+        if (this.config.DebugLogging)
+            this.Monitor.Log($"[SaveContext] Building save context for NPC: {npcName ?? "(none)"}", LogLevel.Trace);
+
+        string playerName = SafeGet(() => Game1.player.Name, "Unknown");
+        string farmName = SafeGet(() => Game1.player.farmName.Value, "Unknown");
+        string? spouseName = null;
+        try
+        {
+            string? raw = Game1.player.spouse;
+            spouseName = string.IsNullOrWhiteSpace(raw) ? null : raw;
+        }
+        catch { }
+        string saveFileName = SafeGet(() => Constants.SaveFolderName ?? string.Empty, string.Empty);
+        string? saveFilePath = null;
+        if (!string.IsNullOrWhiteSpace(saveFileName))
+        {
+            try { saveFilePath = Path.Combine(Constants.SavesPath, saveFileName); }
+            catch { }
+        }
+        string season = SafeGet(() => Game1.currentSeason, "spring");
+        int day = SafeGetValue(() => Game1.Date.DayOfMonth, 0);
+        int year = SafeGetValue(() => Game1.Date.Year, 0);
+        string weather = SafeGet(GetWeather, "clear");
+        string location = SafeGet(() => Game1.currentLocation?.NameOrUniqueName ?? "Unknown", "Unknown");
+        IReadOnlyList<string> seenEvents = SafeGetList(() => Game1.player.eventsSeen.Select(id => id.ToString()).ToList());
+        IReadOnlyList<string> completedQuests = SafeGetList(GetCompletedQuestNames);
+        string communityState = GetCommunityState();
+        string? festivalOrSpecialDay = GetFestivalOrSpecialDay();
+
+        // NPC-specific friendship/relationship fields.
+        int friendshipHearts = 0;
+        bool hasMetNpc = false;
+        bool isDating = false;
+
+        if (!string.IsNullOrWhiteSpace(npcName))
+        {
+            try
+            {
+                if (Game1.player.friendshipData.TryGetValue(npcName, out Friendship? friendship) && friendship is not null)
+                {
+                    friendshipHearts = Math.Clamp(friendship.Points / 250, 0, 14);
+                    isDating = friendship.Status == FriendshipStatus.Dating;
+                    hasMetNpc = friendship.Points > 0 || friendship.TalkedToToday;
+                }
+            }
+            catch (Exception ex)
+            {
+                this.Monitor.Log($"[SaveContext] Error reading friendship for '{npcName}': {ex.Message}", LogLevel.Trace);
+            }
+        }
+
+        bool isSpouse = !string.IsNullOrWhiteSpace(spouseName)
+            && string.Equals(spouseName, npcName, StringComparison.OrdinalIgnoreCase);
+
+        string datingStatus = !string.IsNullOrWhiteSpace(spouseName) ? "Married"
+            : isDating ? "Dating"
+            : "Single";
+
+        string relationshipState = isSpouse ? "Spouse"
+            : isDating ? "Dating"
+            : hasMetNpc && friendshipHearts >= 2 ? "Friend"
+            : hasMetNpc ? "Acquaintance"
+            : !string.IsNullOrWhiteSpace(npcName) ? "Unmet"
+            : "Unknown";
+
+        this.Monitor.Log(
+            $"[SaveContext] Built: player={playerName}, farm={farmName}, npc={npcName ?? "(none)"}, " +
+            $"hearts={friendshipHearts}, relation={relationshipState}, location={location}, " +
+            $"season={season}, day={day}, year={year}",
+            LogLevel.Info);
+
+        return new SaveFileContextSnapshot
+        {
+            SaveFileName = string.IsNullOrWhiteSpace(saveFileName) ? null : saveFileName,
+            SaveFilePath = saveFilePath,
+            PlayerName = playerName,
+            FarmName = farmName,
+            Spouse = spouseName,
+            DatingStatus = datingStatus,
+            FriendshipHearts = friendshipHearts,
+            SeenEvents = seenEvents,
+            CompletedQuests = completedQuests,
+            CommunityState = communityState,
+            Season = season,
+            Day = day,
+            Year = year,
+            Weather = weather,
+            Location = location,
+            FestivalOrSpecialDay = festivalOrSpecialDay,
+            HasMetNpc = hasMetNpc,
+            RelationshipState = relationshipState,
+            CustomUserLoreRelationshipState = ""
+        };
+    }
+
+    private void LogIdentityContext(DialogueContext context, string interceptedNpc)
+    {
+        this.Monitor.Log($"[LivingLore] Intercepted NPC: {interceptedNpc}", LogLevel.Info);
+        this.Monitor.Log($"[LivingLore] CharacterName: {context.CharacterName}", LogLevel.Info);
+        this.Monitor.Log($"[LivingLore] LocationName: {context.Location}", LogLevel.Info);
+        if (!string.Equals(context.CharacterName, interceptedNpc, StringComparison.OrdinalIgnoreCase))
+        {
+            this.Monitor.Log("[LivingLore] WARNING: Character/location mismatch detected.", LogLevel.Warn);
+            this.Monitor.Log($"CharacterName={context.CharacterName}", LogLevel.Warn);
+            this.Monitor.Log($"LocationName={context.Location}", LogLevel.Warn);
+        }
+    }
+
+    private void LogResolvedIdentity(GeneratedDialogueResult? result, DialogueContext context)
+    {
+        string resolved = result?.ResolvedCharacterName ?? context.ResolvedCharacterName;
+        this.Monitor.Log($"[LivingLore] Resolved Character: {resolved}", LogLevel.Info);
+        if (IsIdentityError(result?.Error))
+        {
+            this.Monitor.Log("[LivingLore] WARNING: Character/location mismatch detected.", LogLevel.Warn);
+            this.Monitor.Log($"CharacterName={context.CharacterName}", LogLevel.Warn);
+            this.Monitor.Log($"LocationName={context.Location}", LogLevel.Warn);
+        }
+    }
+
+    private static bool IsIdentityError(string? error)
+    {
+        return !string.IsNullOrWhiteSpace(error)
+            && (error.Contains("Character/location mismatch", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("known location/building/map", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("characterName is null or empty", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>Generates dialogue via the local server (preferred) or the in-process manager. Never throws.</summary>
@@ -711,7 +885,7 @@ public sealed class ModEntry : Mod
 
         string characterName = args[0];
         string topic = args.Length > 1 ? string.Join(' ', args.Skip(1)) : "general";
-        GeneratedDialogueResult? result = await this.GenerateResultAsync(this.BuildContext(characterName, topic), "SMAPI-Command");
+        GeneratedDialogueResult? result = await this.GenerateResultAsync(this.BuildContext(characterName, topic, "SMAPI-Command"), "SMAPI-Command");
         string text = ExtractText(result);
         this.Monitor.Log(result is null ? "No response from dialogue source." : $"Generated for '{characterName}': {text}", LogLevel.Info);
         if (!string.IsNullOrWhiteSpace(text))
@@ -728,7 +902,7 @@ public sealed class ModEntry : Mod
 
         string characterName = args[0];
         this.Monitor.Log($"[Command] livinglore_testdialogue '{characterName}' -> calling server as RequestSource=SMAPI...", LogLevel.Info);
-        GeneratedDialogueResult? result = await this.GenerateResultAsync(this.BuildContext(characterName, "general"), "SMAPI");
+        GeneratedDialogueResult? result = await this.GenerateResultAsync(this.BuildContext(characterName, "general", "SMAPI"), "SMAPI");
         if (result is null)
         {
             this.Monitor.Log("[Command] No result returned (see [Server request]/[Server response] logs above).", LogLevel.Warn);
@@ -755,7 +929,7 @@ public sealed class ModEntry : Mod
 
         string characterName = args[0];
         this.Monitor.Log($"[Command] livinglore_say '{characterName}' -> generating and displaying...", LogLevel.Info);
-        GeneratedDialogueResult? result = await this.GenerateResultAsync(this.BuildContext(characterName, "general"), "SMAPI-Say");
+        GeneratedDialogueResult? result = await this.GenerateResultAsync(this.BuildContext(characterName, "general", "SMAPI-Say"), "SMAPI-Say");
         string text = ExtractText(result);
         if (string.IsNullOrWhiteSpace(text))
         {
@@ -850,6 +1024,54 @@ public sealed class ModEntry : Mod
         catch
         {
             return 0;
+        }
+    }
+
+    private static T SafeGetValue<T>(Func<T> getter, T fallback)
+    {
+        try { return getter(); }
+        catch { return fallback; }
+    }
+
+    private static IReadOnlyList<string> SafeGetList(Func<List<string>> getter)
+    {
+        try { return getter() ?? new List<string>(); }
+        catch { return Array.Empty<string>(); }
+    }
+
+    private static List<string> GetCompletedQuestNames()
+    {
+        // Quest completion names are informational context only.
+        // SDV 1.6 uses a NetBool field named "completed" rather than a simple bool property;
+        // we skip the per-quest check to avoid version-specific API surface issues.
+        return new List<string>();
+    }
+
+    private static string GetCommunityState()
+    {
+        try
+        {
+            if (Game1.MasterPlayer.mailReceived.Contains("JojaMember"))
+                return "JojaMember";
+            if (Game1.MasterPlayer.mailReceived.Contains("cc_Complete"))
+                return "Complete";
+            return "InProgress";
+        }
+        catch
+        {
+            return "Unknown";
+        }
+    }
+
+    private static string? GetFestivalOrSpecialDay()
+    {
+        try
+        {
+            return Utility.isFestivalDay(Game1.Date.DayOfMonth, Game1.Date.Season) ? "Festival" : null;
+        }
+        catch
+        {
+            return null;
         }
     }
 

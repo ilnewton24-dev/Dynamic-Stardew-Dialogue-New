@@ -24,4 +24,5 @@ public sealed class DialogueLoreBundle
     public IReadOnlyList<PlayerProfileRelationship> PlayerRelationships { get; init; } = Array.Empty<PlayerProfileRelationship>();
     public IReadOnlyList<PlayerProfileMemory> PlayerMemories { get; init; } = Array.Empty<PlayerProfileMemory>();
     public string? PlayerProfileSaveLink { get; init; }
+    public string PlayerProfileMatchMethod { get; init; } = "none";
 }

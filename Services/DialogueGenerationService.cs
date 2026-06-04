@@ -5,6 +5,15 @@ namespace LivingLoreDialogue.Services;
 
 public sealed class DialogueGenerationService
 {
+    private static readonly HashSet<string> KnownEnvironmentNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Farm", "FarmHouse", "House", "Cabin", "Town", "Mountain", "Beach", "Mine", "Mines",
+        "BusStop", "Forest", "SeedShop", "JoshHouse", "HaleyHouse", "SamHouse", "ManorHouse",
+        "ScienceHouse", "AnimalShop", "Blacksmith", "FishShop", "Saloon", "Hospital", "Tent",
+        "Backwoods", "Railroad", "Woods", "Sewer", "SkullCave", "WizardHouse", "Greenhouse",
+        "Cellar", "Desert"
+    };
+
     private readonly DialogueContextBuilderService contextBuilder;
     private readonly GeneratedDialogueHistoryRepository historyRepository;
     private readonly GeneratedDialogueOverrideRepository overrideRepository;
@@ -33,18 +42,36 @@ public sealed class DialogueGenerationService
 
     public async Task<GeneratedDialogueResult> GenerateAsync(DialogueContext context, string? relationshipContext, SaveFileContextSnapshot? saveContextOverride = null, long? playerProfileId = null)
     {
+        ApplyDisplayLocation(context);
+        GeneratedDialogueResult result = CreateIdentityResult(context);
+        string? validationError = ValidateIdentity(context);
+        if (validationError is not null)
+        {
+            result.Error = validationError;
+            return result;
+        }
+
         DialogueContextPacket packet = await this.contextBuilder.BuildAsync(context, relationshipContext, saveContextOverride, playerProfileId);
+        result.ActivePlayerProfileName = packet.Lore.PlayerProfile?.ProfileName ?? "";
+        result.PlayerProfileMatchMethod = packet.Lore.PlayerProfileMatchMethod;
+        string resolvedCharacterName = packet.Lore.CanonicalCharacter?.CanonicalName ?? packet.Lore.Character.Name;
+        context.ResolvedCharacterName = resolvedCharacterName;
+        result.ResolvedCharacterName = resolvedCharacterName;
+        if (!string.Equals(context.CharacterName, resolvedCharacterName, StringComparison.OrdinalIgnoreCase))
+        {
+            result.Error = "WARNING: Character/location mismatch detected. "
+                + $"CharacterName={context.CharacterName}; LocationName={context.Location}; ResolvedCharacter={resolvedCharacterName}.";
+            return result;
+        }
+
         string prompt = this.promptBuilder.Build(context, packet.Lore);
         if (!string.IsNullOrWhiteSpace(relationshipContext))
             prompt += $"{Environment.NewLine}Relationship context: {relationshipContext}{Environment.NewLine}";
 
         Character character = packet.Lore.Character;
-        GeneratedDialogueResult result = new()
-        {
-            Prompt = prompt,
-            PromptUsed = prompt,
-            SaveContext = packet.SaveContext
-        };
+        result.Prompt = prompt;
+        result.PromptUsed = prompt;
+        result.SaveContext = packet.SaveContext;
 
         if (!this.openAiDialogueService.HasApiKey)
         {
@@ -116,6 +143,42 @@ public sealed class DialogueGenerationService
         }
 
         return result;
+    }
+
+    private static GeneratedDialogueResult CreateIdentityResult(DialogueContext context)
+    {
+        return new GeneratedDialogueResult
+        {
+            InterceptedNpcName = context.InterceptedNpcName,
+            CharacterName = context.CharacterName,
+            DisplayName = context.DisplayName,
+            ResolvedCharacterName = context.ResolvedCharacterName,
+            LocationName = context.DisplayLocation,
+            InternalLocationId = context.InternalLocationId,
+            DisplayLocation = context.DisplayLocation
+        };
+    }
+
+    private static void ApplyDisplayLocation(DialogueContext context)
+    {
+        string rawLocation = string.IsNullOrWhiteSpace(context.InternalLocationId)
+            ? context.Location
+            : context.InternalLocationId;
+        LocationDisplay resolved = LocationDisplayResolver.Resolve(rawLocation);
+        context.InternalLocationId = resolved.InternalId;
+        context.DisplayLocation = resolved.DisplayName;
+        context.Location = resolved.DisplayName;
+        if (context.SaveContext is not null)
+            context.SaveContext.Location = resolved.DisplayName;
+    }
+
+    private static string? ValidateIdentity(DialogueContext context)
+    {
+        if (string.IsNullOrWhiteSpace(context.CharacterName))
+            return "Rejected generation: characterName is null or empty.";
+        if (KnownEnvironmentNames.Contains(context.CharacterName.Trim()))
+            return $"Rejected generation: characterName '{context.CharacterName}' is a known location/building/map, not a character.";
+        return null;
     }
 
     private static bool ShouldRetryForQuality(DialogueQualityScores scores, GeneratedDialogue dialogue)

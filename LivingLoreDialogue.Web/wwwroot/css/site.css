@@ -318,6 +318,22 @@ form,
     transform: translateY(-1px);
 }
 
+.definition-list {
+    display: grid;
+    grid-template-columns: minmax(120px, max-content) 1fr;
+    gap: 0.4rem 1rem;
+    margin: 0 0 1rem;
+}
+
+.definition-list dt {
+    color: var(--muted);
+    font-weight: 800;
+}
+
+.definition-list dd {
+    margin: 0;
+}
+
 .metric span {
     color: var(--muted);
     font-size: 12px;

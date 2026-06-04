@@ -10,6 +10,12 @@ public sealed class DialogueGenerationTrace
     public long GeneratedDialogueId { get; set; }
     public DateTime GeneratedAt { get; set; }
     public long CharacterId { get; set; }
+    public string InterceptedNpcName { get; set; } = "";
+    public string CharacterName { get; set; } = "";
+    public string ResolvedCharacterName { get; set; } = "";
+    public string LocationName { get; set; } = "";
+    public string InternalLocationId { get; set; } = "";
+    public string DisplayLocationName { get; set; } = "";
 
     /// <summary>Serialized <see cref="SaveFileContextSnapshot"/>.</summary>
     public string SaveContextSnapshot { get; set; } = "{}";
@@ -41,7 +47,13 @@ public sealed class DialogueGenerationTrace
     /// <summary>The save-file link used to resolve the player profile, if any.</summary>
     public string? SaveFileLinkUsed { get; set; }
 
+    /// <summary>How the active player profile was selected for this generation.</summary>
+    public string PlayerProfileMatchMethod { get; set; } = "none";
+
     public string PromptVersion { get; set; } = "";
     public string PromptText { get; set; } = "";
     public string ModelUsed { get; set; } = "";
+
+    /// <summary>Where this request originated ("SMAPI-Harmony", "SMAPI-Dialogue", "Dashboard", etc.).</summary>
+    public string RequestSource { get; set; } = "";
 }

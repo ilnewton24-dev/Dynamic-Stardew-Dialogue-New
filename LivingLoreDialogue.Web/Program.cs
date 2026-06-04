@@ -471,9 +471,16 @@ app.MapGet("/api/dialogue/explain/{generatedDialogueId:long}", async (long gener
             trace.GeneratedDialogueId,
             trace.GeneratedAt,
             trace.CharacterId,
+            trace.InterceptedNpcName,
+            trace.CharacterName,
+            trace.ResolvedCharacterName,
+            location = trace.LocationName,
+            internalLocation = trace.InternalLocationId,
+            displayLocation = trace.DisplayLocationName,
             trace.PromptVersion,
             trace.ModelUsed,
             promptText = trace.PromptText,
+            requestSource = trace.RequestSource,
             saveContext = ParseJson(trace.SaveContextSnapshot),
             memoriesUsed = ParseJson(trace.MemoriesUsed),
             relationshipsUsed = ParseJson(trace.RelationshipsUsed),
@@ -483,7 +490,8 @@ app.MapGet("/api/dialogue/explain/{generatedDialogueId:long}", async (long gener
             playerProfileUsed = ParseJson(trace.PlayerProfileUsed),
             playerRelationshipNotesUsed = ParseJson(trace.PlayerRelationshipNotesUsed),
             playerMemoriesUsed = ParseJson(trace.PlayerMemoriesUsed),
-            saveFileLinkUsed = trace.SaveFileLinkUsed
+            saveFileLinkUsed = trace.SaveFileLinkUsed,
+            playerProfileMatchMethod = trace.PlayerProfileMatchMethod
         }
     });
 });
@@ -743,20 +751,69 @@ static async Task<IResult> GenerateDialogue(
     ILoggerFactory loggerFactory)
 {
     ILogger logger = loggerFactory.CreateLogger("DialogueTestEndpoint");
-    logger.LogInformation("Dialogue test endpoint called for character '{CharacterName}'.", request.CharacterName);
+
+    bool isSmapiRequest = request.RequestSource?.Contains("SMAPI", StringComparison.OrdinalIgnoreCase) == true;
+    if (isSmapiRequest)
+        logger.LogInformation("Received dialogue request from SMAPI (source={RequestSource}).", request.RequestSource);
+    else
+        logger.LogInformation("Dialogue test endpoint called for character '{CharacterName}'.", request.CharacterName);
+
+    logger.LogInformation("Received characterName={CharacterName}, rawLocation={RawLocation}.", request.CharacterName, request.InternalLocationId ?? request.LocationName ?? request.Location);
+
+    // When SMAPI provides a save context, use it directly so live game state reaches the prompt.
+    SaveFileContextSnapshot? saveContextOverride = null;
+    if (isSmapiRequest && request.SaveContext is SaveFileContextSnapshot sc)
+    {
+        saveContextOverride = sc;
+        logger.LogInformation("Using SMAPI save context: saveFileName={SaveFileName}, playerName={PlayerName}, farmName={FarmName}, location={Location}.",
+            sc.SaveFileName, sc.PlayerName, sc.FarmName, sc.Location);
+        if (sc.PlayerName is "Unknown" or "")
+            logger.LogWarning("SMAPI save context has Unknown playerName — live game state may not be available.");
+        if (sc.FarmName is "Unknown" or "")
+            logger.LogWarning("SMAPI save context has Unknown farmName — live game state may not be available.");
+    }
+    else if (isSmapiRequest)
+    {
+        logger.LogWarning("SMAPI request did not include a save context; falling back to defaults.");
+    }
+
+    string rawLocation = FirstNonEmpty(request.InternalLocationId, request.LocationName, request.Location);
     DialogueContext context = new()
     {
         CharacterName = request.CharacterName,
+        DisplayName = string.IsNullOrWhiteSpace(request.DisplayName) ? request.CharacterName : request.DisplayName,
+        InterceptedNpcName = string.IsNullOrWhiteSpace(request.InterceptedNpcName) ? request.CharacterName : request.InterceptedNpcName,
         Topic = request.Topic,
         Season = request.Season,
         Weather = request.Weather,
-        Location = request.Location,
-        FriendshipLevel = request.FriendshipLevel
+        InternalLocationId = rawLocation,
+        DisplayLocation = request.DisplayLocation ?? "",
+        Location = rawLocation,
+        FriendshipLevel = request.FriendshipLevel,
+        RequestSource = request.RequestSource ?? "Dashboard"
     };
+
+    logger.LogInformation("[LivingLore] Intercepted NPC: {InterceptedNpc}", context.InterceptedNpcName);
+    logger.LogInformation("[LivingLore] CharacterName: {CharacterName}", context.CharacterName);
+    logger.LogInformation("[LivingLore] Raw Location ID: {RawLocationId}", context.InternalLocationId);
+    logger.LogInformation("Save context source: {Source}.", saveContextOverride is not null ? "SMAPI" : "fallback defaults");
 
     try
     {
-        GeneratedDialogueResult result = await service.GenerateAsync(context, request.RelationshipContext, null, request.PlayerProfileId);
+        GeneratedDialogueResult result = await service.GenerateAsync(context, request.RelationshipContext, saveContextOverride, request.PlayerProfileId);
+        logger.LogInformation("[LivingLore] Resolved Character: {ResolvedCharacter}", result.ResolvedCharacterName);
+        logger.LogInformation("[LivingLore] Resolved Display Location: {DisplayLocation}", result.DisplayLocation);
+        logger.LogInformation(
+            "Player profile resolution: found={Found}, profileName={ProfileName}, matchMethod={MatchMethod}.",
+            !string.IsNullOrWhiteSpace(result.ActivePlayerProfileName),
+            string.IsNullOrWhiteSpace(result.ActivePlayerProfileName) ? "(none)" : result.ActivePlayerProfileName,
+            result.PlayerProfileMatchMethod);
+        if (IsIdentityError(result.Error))
+        {
+            logger.LogWarning("[LivingLore] WARNING: Character/location mismatch detected.");
+            logger.LogWarning("CharacterName={CharacterName}", context.CharacterName);
+            logger.LogWarning("LocationName={LocationName}", context.Location);
+        }
         logger.LogInformation(
             "Dialogue test result for '{CharacterName}': promptBuilt={PromptBuilt}, dialogueReturned={DialogueReturned}, error={Error}",
             request.CharacterName,
@@ -767,6 +824,15 @@ static async Task<IResult> GenerateDialogue(
         return Results.Ok(new
         {
             saveContext = result.SaveContext,
+            interceptedNpcName = result.InterceptedNpcName,
+            characterName = result.CharacterName,
+            displayName = result.DisplayName,
+            resolvedCharacterName = result.ResolvedCharacterName,
+            locationName = result.LocationName,
+            internalLocationId = result.InternalLocationId,
+            displayLocation = result.DisplayLocation,
+            activePlayerProfileName = result.ActivePlayerProfileName,
+            playerProfileMatchMethod = result.PlayerProfileMatchMethod,
             promptUsed = result.PromptUsed,
             returnedDialogue = result.ReturnedDialogue,
             error = result.Error,
@@ -789,6 +855,15 @@ static async Task<IResult> GenerateDialogue(
                 context.FriendshipLevel,
                 request.RelationshipContext
             },
+            interceptedNpcName = context.InterceptedNpcName,
+            characterName = context.CharacterName,
+            displayName = context.DisplayName,
+            resolvedCharacterName = context.ResolvedCharacterName,
+            locationName = context.Location,
+            internalLocationId = context.InternalLocationId,
+            displayLocation = context.DisplayLocation,
+            activePlayerProfileName = "",
+            playerProfileMatchMethod = "none",
             promptUsed = "",
             returnedDialogue = "",
             error = ex.Message,
@@ -937,6 +1012,25 @@ static string? GetCharacterField(Character? character, string fieldName)
     };
 }
 
+static bool IsIdentityError(string? error)
+{
+    return !string.IsNullOrWhiteSpace(error)
+        && (error.Contains("Character/location mismatch", StringComparison.OrdinalIgnoreCase)
+            || error.Contains("known location/building/map", StringComparison.OrdinalIgnoreCase)
+            || error.Contains("characterName is null or empty", StringComparison.OrdinalIgnoreCase));
+}
+
+static string FirstNonEmpty(params string?[] values)
+{
+    foreach (string? value in values)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+            return value;
+    }
+
+    return "Unknown";
+}
+
 namespace LivingLoreDialogue.Web
 {
     public sealed class LivingLoreWebOptions
@@ -964,13 +1058,20 @@ namespace LivingLoreDialogue.Web
     public sealed record RelationshipRequest(long CharacterA, long CharacterB, string RelationshipType, int Strength);
     public sealed record DialogueTestRequest(
         string CharacterName,
+        string? DisplayName,
+        string? InterceptedNpcName,
+        string? InternalLocationId,
+        string? DisplayLocation,
+        string? LocationName,
         string Topic,
         string Season,
         string Weather,
         string Location,
         int FriendshipLevel,
         string? RelationshipContext,
-        long? PlayerProfileId = null);
+        long? PlayerProfileId = null,
+        string? RequestSource = null,
+        SaveFileContextSnapshot? SaveContext = null);
     public sealed record SettingsRequest(string OpenAiModel, string? GamePath, string ModsFolderPath, bool EnableLiveInGameDialogueGeneration);
     public sealed record ModelRequest(string Model);
     public sealed record SimulateRequest(long ScenarioId, string CharacterName, string Topic);

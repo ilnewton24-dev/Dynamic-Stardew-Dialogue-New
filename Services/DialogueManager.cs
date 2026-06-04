@@ -5,6 +5,15 @@ namespace LivingLoreDialogue.Services;
 
 public sealed class DialogueManager
 {
+    private static readonly HashSet<string> KnownEnvironmentNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Farm", "FarmHouse", "House", "Cabin", "Town", "Mountain", "Beach", "Mine", "Mines",
+        "BusStop", "Forest", "SeedShop", "JoshHouse", "HaleyHouse", "SamHouse", "ManorHouse",
+        "ScienceHouse", "AnimalShop", "Blacksmith", "FishShop", "Saloon", "Hospital", "Tent",
+        "Backwoods", "Railroad", "Woods", "Sewer", "SkullCave", "WizardHouse", "Greenhouse",
+        "Cellar", "Desert"
+    };
+
     private readonly CharacterRepository characterRepository;
     private readonly RelationshipRepository relationshipRepository;
     private readonly EventRepository eventRepository;
@@ -43,6 +52,11 @@ public sealed class DialogueManager
 
     public async Task<GeneratedDialogue> GenerateAsync(DialogueContext context)
     {
+        if (string.IsNullOrWhiteSpace(context.CharacterName))
+            throw new InvalidOperationException("Rejected generation: characterName is null or empty.");
+        if (KnownEnvironmentNames.Contains(context.CharacterName.Trim()))
+            throw new InvalidOperationException($"Rejected generation: characterName '{context.CharacterName}' is a known location/building/map, not a character.");
+
         string cacheKey = BuildCacheKey(context);
         if (this.cache.TryGetValue(cacheKey, out CacheEntry? cached) && cached.ExpiresAtUtc > DateTime.UtcNow)
             return cached.Dialogue;

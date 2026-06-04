@@ -82,10 +82,36 @@ public sealed class PlayerProfileRepository
             FROM PlayerProfileSaveLinks l
             JOIN PlayerProfiles p ON p.Id = l.PlayerProfileId
             WHERE l.SaveFileName = @saveFileName
-            ORDER BY l.IsDefaultForSave DESC, l.UpdatedAt DESC
+            ORDER BY l.IsDefaultForSave DESC, p.IsActive DESC, l.UpdatedAt DESC
             LIMIT 1;
             ";
         command.Parameters.AddWithValue("@saveFileName", saveFileName);
+
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        return await reader.ReadAsync() ? MapProfile(reader) : null;
+    }
+
+    /// <summary>Resolves an active profile matching the live farmer and farm names, or null.</summary>
+    public async Task<PlayerProfile?> GetByFarmerAndFarmAsync(string playerName, string farmName)
+    {
+        if (string.IsNullOrWhiteSpace(playerName) || string.IsNullOrWhiteSpace(farmName))
+            return null;
+
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = $@"
+            SELECT {ProfileColumns}
+            FROM PlayerProfiles
+            WHERE IsActive = 1
+              AND FarmerName = @playerName COLLATE NOCASE
+              AND FarmName = @farmName COLLATE NOCASE
+            ORDER BY UpdatedAt DESC
+            LIMIT 1;
+            ";
+        command.Parameters.AddWithValue("@playerName", playerName);
+        command.Parameters.AddWithValue("@farmName", farmName);
 
         await using SqliteDataReader reader = await command.ExecuteReaderAsync();
         return await reader.ReadAsync() ? MapProfile(reader) : null;
@@ -321,6 +347,19 @@ public sealed class PlayerProfileRepository
     {
         await using SqliteConnection connection = this.connectionFactory.CreateConnection();
         await connection.OpenAsync();
+
+        if (link.IsDefaultForSave)
+        {
+            await using SqliteCommand clearCommand = connection.CreateCommand();
+            clearCommand.CommandText = @"
+                UPDATE PlayerProfileSaveLinks
+                SET IsDefaultForSave = 0, UpdatedAt = @now
+                WHERE SaveFileName = @saveFileName;
+                ";
+            clearCommand.Parameters.AddWithValue("@saveFileName", link.SaveFileName);
+            clearCommand.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("O"));
+            await clearCommand.ExecuteNonQueryAsync();
+        }
 
         await using SqliteCommand command = connection.CreateCommand();
         command.CommandText = @"

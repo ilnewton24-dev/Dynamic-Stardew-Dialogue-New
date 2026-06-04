@@ -25,6 +25,7 @@
     <Compile Include="..\Services\DialogueQualityService.cs" LinkBase="Services" />
     <Compile Include="..\Services\DialogueSourceScannerService.cs" LinkBase="Services" />
     <Compile Include="..\Services\GameSimulationService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\LocationDisplayResolver.cs" LinkBase="Services" />
     <Compile Include="..\Services\ModScannerService.cs" LinkBase="Services" />
     <Compile Include="..\Services\ModScanCoordinator.cs" LinkBase="Services" />
     <Compile Include="..\Services\OpenAiDialogueService.cs" LinkBase="Services" />
