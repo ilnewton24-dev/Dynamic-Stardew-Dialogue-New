@@ -9,6 +9,7 @@
   "ModsFolderPath": "",
   "EnableLiveInGameDialogueGeneration": true,
   "OverrideNpcDialogue": true,
+  "UseHarmonyDialogueInterception": true,
   "UseLocalWebApiForDialogue": true,
   "LocalWebApiBaseUrl": "http://localhost:5077",
   "DebugLogging": true,

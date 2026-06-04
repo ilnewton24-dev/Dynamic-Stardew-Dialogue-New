@@ -5,6 +5,8 @@
     <Nullable>enable</Nullable>
     <AssemblyName>LivingLoreDialogue</AssemblyName>
     <RootNamespace>LivingLoreDialogue</RootNamespace>
+    <!-- Reference Harmony (via SMAPI) so the mod can patch NPC.checkAction. -->
+    <EnableHarmony>true</EnableHarmony>
   </PropertyGroup>
 
   <ItemGroup>

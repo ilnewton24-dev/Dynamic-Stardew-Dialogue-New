@@ -15,6 +15,12 @@ public sealed class ModConfig
     /// <summary>When true, talking to an NPC suppresses the vanilla line and shows generated dialogue instead.</summary>
     public bool OverrideNpcDialogue { get; set; } = true;
 
+    /// <summary>
+    /// When true, intercept NPC.checkAction via Harmony so generated dialogue replaces vanilla
+    /// before it opens (no vanilla flash). When false, fall back to the MenuChanged replacement.
+    /// </summary>
+    public bool UseHarmonyDialogueInterception { get; set; } = true;
+
     public bool UseLocalWebApiForDialogue { get; set; } = true;
     public string LocalWebApiBaseUrl { get; set; } = "http://localhost:5077";
     public bool DebugLogging { get; set; } = true;

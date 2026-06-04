@@ -133,6 +133,23 @@ public sealed class CharacterRepository
         return Convert.ToInt32(await command.ExecuteScalarAsync());
     }
 
+    /// <summary>All distinct names of active characters (used to cache eligibility for in-game interception).</summary>
+    public async Task<IReadOnlyList<string>> GetActiveNamesAsync()
+    {
+        List<string> names = new();
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "SELECT DISTINCT Name FROM Characters WHERE IsActive = 1 AND Name IS NOT NULL AND Name <> '';";
+
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            names.Add(reader.GetString(0));
+
+        return names;
+    }
+
     /// <summary>True if an active character row exists with the given name (case-insensitive).</summary>
     public async Task<bool> IsActiveCharacterAsync(string name)
     {

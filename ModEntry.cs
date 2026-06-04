@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using HarmonyLib;
 using LivingLoreDialogue.Data;
 using LivingLoreDialogue.Models;
 using LivingLoreDialogue.Repositories;
@@ -45,6 +46,16 @@ public sealed class ModEntry : Mod
     private DateTime suppressActionUntil = DateTime.MinValue;
     private bool suppressionWindowActive;
 
+    // In-memory cache of active character names, refreshed on save load / after scans. The Harmony
+    // prefix must decide eligibility synchronously, so it cannot query the database directly.
+    private volatile HashSet<string> activeCharacterNames = new(StringComparer.OrdinalIgnoreCase);
+
+    // Pending Harmony generation tracking: a newer request supersedes an older one for the same NPC.
+    private long dialogueRequestCounter;
+    private long pendingRequestId;
+
+    private const string HarmonyPlaceholderText = "...";
+
     public override void Entry(IModHelper helper)
     {
         this.config = helper.ReadConfig<ModConfig>();
@@ -57,8 +68,14 @@ public sealed class ModEntry : Mod
         this.Monitor.Log($"  OverrideNpcDialogue (suppress vanilla, show generated) = {this.config.OverrideNpcDialogue}", LogLevel.Info);
         this.Monitor.Log($"  UseLocalWebApiForDialogue = {this.config.UseLocalWebApiForDialogue}", LogLevel.Info);
         this.Monitor.Log($"  Server URL = {this.config.LocalWebApiBaseUrl}", LogLevel.Info);
+        this.Monitor.Log($"  UseHarmonyDialogueInterception = {this.config.UseHarmonyDialogueInterception}", LogLevel.Info);
         this.Monitor.Log($"  DebugLogging = {this.config.DebugLogging}", LogLevel.Info);
-        this.Monitor.Log("Harmony patches applied: NONE (this mod uses SMAPI events, not Harmony).", LogLevel.Info);
+
+        // ---- Harmony patch (intercept NPC dialogue before vanilla opens) --------------------
+        if (this.config.UseHarmonyDialogueInterception)
+            this.ApplyHarmonyPatches();
+        else
+            this.Monitor.Log("Harmony interception DISABLED by config; using MenuChanged replacement fallback.", LogLevel.Info);
 
         // ---- Event subscriptions -----------------------------------------------------------
         helper.Events.GameLoop.GameLaunched += this.OnGameLaunched;
@@ -100,6 +117,7 @@ public sealed class ModEntry : Mod
 
             CharacterRepository characterRepository = new(connectionFactory);
             this.characterRepository = characterRepository; // used to validate that a speaker is a real, active character
+            await this.RefreshActiveCharacterCacheAsync(); // prime the interception eligibility cache from persisted data
             RelationshipRepository relationshipRepository = new(connectionFactory);
             EventRepository eventRepository = new(connectionFactory);
             MemoryRepository memoryRepository = new(connectionFactory);
@@ -147,6 +165,9 @@ public sealed class ModEntry : Mod
 
                     foreach (string error in summary.Errors)
                         this.Monitor.Log($"Living Lore scan warning: {error}", LogLevel.Warn);
+
+                    // Refresh the interception eligibility cache with the post-scan active set.
+                    await this.RefreshActiveCharacterCacheAsync();
                 });
             }
 
@@ -265,6 +286,7 @@ public sealed class ModEntry : Mod
     private void OnSaveLoaded(object? sender, SaveLoadedEventArgs e)
     {
         this.Monitor.Log($"[Event] SaveLoaded. Player='{Game1.player?.Name}', location='{Game1.currentLocation?.NameOrUniqueName}'. Living Lore interaction detection is active.", LogLevel.Info);
+        _ = Task.Run(this.RefreshActiveCharacterCacheAsync); // ensure the eligibility cache reflects the loaded save
     }
 
     private void OnWarped(object? sender, WarpedEventArgs e)
@@ -351,6 +373,15 @@ public sealed class ModEntry : Mod
                 return;
             }
 
+            // When Harmony interception is active it handles dialogue before vanilla opens, so the
+            // MenuChanged replacement path must stand down to avoid the two systems fighting.
+            if (this.config.UseHarmonyDialogueInterception)
+            {
+                if (this.config.DebugLogging)
+                    this.Monitor.Log("[MenuChanged] Harmony interception is active; MenuChanged replacement is disabled (log only).", LogLevel.Trace);
+                return;
+            }
+
             // Debounce: also stops our own replacement box (same speaker) from re-triggering.
             if (this.RecentlyHandled(speaker.Name))
             {
@@ -385,6 +416,137 @@ public sealed class ModEntry : Mod
         if (!await this.characterRepository.IsActiveCharacterAsync(speaker.Name))
             return $"'{speaker.Name}' is not present in the active characters table";
         return null;
+    }
+
+    // ===================== Harmony interception (NPC.checkAction prefix) ====================
+
+    private void ApplyHarmonyPatches()
+    {
+        try
+        {
+            NpcCheckActionPatch.Mod = this;
+            Harmony harmony = new(this.ModManifest.UniqueID);
+            harmony.Patch(
+                original: AccessTools.Method(typeof(NPC), nameof(NPC.checkAction)),
+                prefix: new HarmonyMethod(typeof(NpcCheckActionPatch), nameof(NpcCheckActionPatch.Prefix)));
+            this.Monitor.Log("Harmony patches applied: NPC.checkAction prefix (dialogue interception).", LogLevel.Info);
+        }
+        catch (Exception ex)
+        {
+            this.Monitor.Log($"[Harmony] Failed to patch NPC.checkAction: {ex}. Falling back to MenuChanged replacement.", LogLevel.Error);
+            // Disable interception so the MenuChanged path takes over.
+            this.config.UseHarmonyDialogueInterception = false;
+        }
+    }
+
+    private async Task RefreshActiveCharacterCacheAsync()
+    {
+        try
+        {
+            if (this.characterRepository is null)
+                return;
+            IReadOnlyList<string> names = await this.characterRepository.GetActiveNamesAsync();
+            this.activeCharacterNames = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+            this.Monitor.Log($"[Harmony] Active character cache refreshed: {this.activeCharacterNames.Count} name(s).", LogLevel.Info);
+        }
+        catch (Exception ex)
+        {
+            this.Monitor.Log($"[Harmony] Active character cache refresh failed: {ex.Message}", LogLevel.Warn);
+        }
+    }
+
+    private bool IsEligibleSpeaker(NPC npc, out string reason)
+    {
+        reason = "";
+        if (npc is null || string.IsNullOrEmpty(npc.Name)) { reason = "no NPC/name"; return false; }
+        if (!npc.IsVillager) { reason = "not a villager NPC"; return false; }
+        if (BlockedSpeakerNames.Contains(npc.Name)) { reason = $"'{npc.Name}' is a location/building/object"; return false; }
+        if (!this.activeCharacterNames.Contains(npc.Name)) { reason = $"'{npc.Name}' not in active character cache"; return false; }
+        return true;
+    }
+
+    /// <summary>
+    /// Called by the Harmony prefix on the game thread. Returns true to let vanilla NPC.checkAction
+    /// run, or false to intercept (after showing a placeholder and starting async generation).
+    /// </summary>
+    internal bool TryInterceptNpcDialogue(NPC npc, Farmer who, ref bool result)
+    {
+        // Respect master switches; any "no" means vanilla behavior.
+        if (!this.config.UseHarmonyDialogueInterception || !this.config.EnableLiveInGameDialogueGeneration || !this.config.OverrideNpcDialogue)
+            return true;
+        if (!Context.IsWorldReady || !Context.IsPlayerFree)
+            return true;
+        if (who is null || !who.IsLocalPlayer)
+            return true;
+        // Holding an item (e.g. a gift) -> let vanilla handle gifting/tool use.
+        if (who.ActiveObject is not null)
+            return true;
+
+        if (!this.IsEligibleSpeaker(npc, out string reason))
+        {
+            if (this.config.DebugLogging)
+                this.Monitor.Log($"[Harmony] checkAction for '{npc?.Name ?? "null"}' NOT eligible ({reason}); vanilla dialogue continues.", LogLevel.Trace);
+            return true; // task 3: not eligible -> vanilla
+        }
+
+        // Eligible: intercept before vanilla opens any dialogue.
+        long requestId = ++this.dialogueRequestCounter;
+        this.pendingRequestId = requestId;
+        this.Monitor.Log($"[Harmony] INTERCEPTING checkAction for '{npc.Name}' (request #{requestId}). Showing placeholder, generating asynchronously.", LogLevel.Info);
+
+        result = true; // tell the game the action was handled
+
+        // Show the placeholder immediately using the compile-safe NPC dialogue method.
+        this.DisplayGeneratedDialogue(npc, HarmonyPlaceholderText, replaceOpenBox: false);
+        this.RequestGeneratedForHarmony(npc, requestId);
+
+        return false; // task 4: skip vanilla NPC.checkAction
+    }
+
+    private void RequestGeneratedForHarmony(NPC npc, long requestId)
+    {
+        string speakerName = npc.Name;
+        DialogueContext context = this.BuildContext(speakerName, "general");
+        _ = Task.Run(async () =>
+        {
+            GeneratedDialogueResult? result = await this.GenerateResultAsync(context, "SMAPI-Harmony");
+            string text = ExtractText(result);
+            bool usable = result is not null && string.IsNullOrWhiteSpace(result.Error) && !string.IsNullOrWhiteSpace(text);
+            this.Monitor.Log($"[Harmony] Generation returned for '{speakerName}' (request #{requestId}, usable={usable}); applying on next update tick.", LogLevel.Info);
+
+            this.mainThreadActions.Enqueue(() =>
+            {
+                // Task 7: verify we are still in-game, no newer request superseded this one, and the
+                // same speaker's dialogue box is still open.
+                if (!Context.IsWorldReady)
+                {
+                    this.Monitor.Log($"[Harmony] DISCARDED '{speakerName}' (#{requestId}): no longer in-game.", LogLevel.Info);
+                    return;
+                }
+                if (requestId != this.pendingRequestId)
+                {
+                    this.Monitor.Log($"[Harmony] DISCARDED '{speakerName}' (#{requestId}): superseded by a newer request (#{this.pendingRequestId}).", LogLevel.Info);
+                    return;
+                }
+                bool boxOpen = Game1.activeClickableMenu is DialogueBox;
+                NPC? current = Game1.currentSpeaker;
+                if (!boxOpen || (current is not null && !string.Equals(current.Name, speakerName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    this.Monitor.Log($"[Harmony] DISCARDED '{speakerName}' (#{requestId}): dialogue closed or speaker changed (boxOpen={boxOpen}, current='{current?.Name ?? "none"}').", LogLevel.Info);
+                    return;
+                }
+
+                if (!usable)
+                {
+                    // Task 8: generation failed -> show a graceful fallback line in place of the placeholder.
+                    this.Monitor.Log($"[Harmony] Generation failed/empty for '{speakerName}'; showing fallback line. Error='{result?.Error}'.", LogLevel.Warn);
+                    this.DisplayGeneratedDialogue(npc, $"({npc.displayName ?? speakerName} pauses for a moment.)", replaceOpenBox: true);
+                    return;
+                }
+
+                this.DisplayGeneratedDialogue(npc, text, replaceOpenBox: true);
+            });
+        });
     }
 
     private static int CountVillagers(GameLocation? location)
@@ -442,8 +604,7 @@ public sealed class ModEntry : Mod
                 }
 
                 // Replace the still-open vanilla box for the same speaker with the generated line.
-                Game1.exitActiveMenu();
-                this.DisplayGeneratedDialogue(speaker, text);
+                this.DisplayGeneratedDialogue(speaker, text, replaceOpenBox: true);
             });
         });
     }
@@ -452,8 +613,12 @@ public sealed class ModEntry : Mod
     /// Shows generated dialogue as a normal Stardew NPC dialogue box (stays open until dismissed)
     /// and starts a short input-suppression window so the triggering click cannot close it.
     /// </summary>
-    private void DisplayGeneratedDialogue(NPC? npc, string text)
+    private void DisplayGeneratedDialogue(NPC? npc, string text, bool replaceOpenBox = false)
     {
+        // When replacing (e.g. placeholder -> generated), close the currently open dialogue first.
+        if (replaceOpenBox && Game1.activeClickableMenu is DialogueBox)
+            Game1.exitActiveMenu();
+
         bool shown = false;
         try
         {
@@ -705,5 +870,32 @@ public sealed class ModEntry : Mod
         string modsFolderPath = this.GetConfiguredModsFolderPath();
         DirectoryInfo? gameDirectory = Directory.GetParent(modsFolderPath);
         return gameDirectory?.FullName ?? modsFolderPath;
+    }
+}
+
+/// <summary>
+/// Harmony prefix on <see cref="NPC.checkAction"/>. Lets the mod intercept eligible NPC dialogue
+/// before vanilla opens it. All decision logic lives in <see cref="ModEntry.TryInterceptNpcDialogue"/>.
+/// </summary>
+internal static class NpcCheckActionPatch
+{
+    public static ModEntry? Mod;
+
+    // Returns false to skip the original NPC.checkAction, true to let it run.
+    public static bool Prefix(NPC __instance, Farmer who, ref bool __result)
+    {
+        ModEntry? mod = Mod;
+        if (mod is null)
+            return true;
+
+        try
+        {
+            return mod.TryInterceptNpcDialogue(__instance, who, ref __result);
+        }
+        catch
+        {
+            // Never break vanilla interaction if interception throws.
+            return true;
+        }
     }
 }
