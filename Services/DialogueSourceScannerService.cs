@@ -38,6 +38,7 @@ public sealed class DialogueSourceScannerService
         int sourcesFound = 0;
         List<string> errors = new();
         List<string> warnings = new();
+        List<string> diagnostics = new();
         List<DialogueSource> pendingSources = new();
         HashSet<(string? SourceModId, string FilePath)> scannedDialogueFiles = new();
         HashSet<long> touchedCanonicalIds = new();
@@ -106,9 +107,7 @@ public sealed class DialogueSourceScannerService
                 if (parseResult.Document is null && extracted.Count == 0 && !string.IsNullOrWhiteSpace(parseResult.Warning))
                     errors.Add($"Skipped dialogue file '{filePath}': {parseResult.Warning}");
                 else if (!string.IsNullOrWhiteSpace(warning))
-                    warnings.Add($"Dialogue file '{filePath}' recovered with {parseResult.ParserUsed}; extracted {extracted.Count} line(s). Warning: {warning}");
-
-                warnings.Add($"Dialogue file '{filePath}': detectedCharacter='{detectedCharacter}', parser='{parseResult.ParserUsed}', linesExtracted={extracted.Count}{(string.IsNullOrWhiteSpace(warning) ? "" : $", warning='{warning}'")}.");
+                    diagnostics.Add($"Dialogue file '{filePath}' classified={ZeroLineClassification.LenientJsonRecovered}, parser='{parseResult.ParserUsed}', linesExtracted={extracted.Count}. Recovered from: {warning}");
 
                 foreach (DialogueSource source in extracted)
                 {
@@ -130,6 +129,22 @@ public sealed class DialogueSourceScannerService
                             sourcesFound++;
                         }
                     }
+                }
+
+                int finalExtractedCount = extracted.Count;
+                if (finalExtractedCount == 0)
+                {
+                    ZeroLineClassification classification = ClassifyZeroLineFile(filePath, rawJson, parseResult);
+                    string diagnostic = $"Dialogue file '{filePath}': detectedCharacter='{detectedCharacter}', parser='{parseResult.ParserUsed}', linesExtracted=0, classification={classification}.";
+                    if (classification == ZeroLineClassification.NoDialogueFound)
+                        warnings.Add(diagnostic);
+                    else
+                        System.Diagnostics.Debug.WriteLine($"[DialogueSourceScanner] {diagnostic}");
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[DialogueSourceScanner] Dialogue file '{filePath}': detectedCharacter='{detectedCharacter}', parser='{parseResult.ParserUsed}', linesExtracted={finalExtractedCount}.");
                 }
             }
         }
@@ -153,7 +168,8 @@ public sealed class DialogueSourceScannerService
             SourcesFound = sourcesFound,
             SourcesDeactivated = sourcesDeactivated,
             Errors = errors,
-            Warnings = warnings
+            Warnings = warnings,
+            Diagnostics = diagnostics
         };
     }
 
@@ -219,7 +235,7 @@ public sealed class DialogueSourceScannerService
                     if (!patch.TryGetProperty(propertyName, out JsonElement entries) || entries.ValueKind != JsonValueKind.Object)
                         continue;
 
-                    foreach ((string key, string value) in EnumerateDialogueStrings(entries))
+                    foreach ((string key, string value) in EnumerateDialogueStrings(entries, dialogueContext: true))
                     {
                         string? characterName = targetName ?? NameFromEntryKey(key) ?? NameFromDialogueFilePath(filePath);
                         if (string.IsNullOrWhiteSpace(characterName))
@@ -249,7 +265,7 @@ public sealed class DialogueSourceScannerService
         string? fileCharacterName = NameFromDialogueFilePath(filePath);
         if (!string.IsNullOrWhiteSpace(fileCharacterName) && root.ValueKind == JsonValueKind.Object)
         {
-            foreach ((string key, string value) in EnumerateDialogueStrings(root))
+            foreach ((string key, string value) in EnumerateDialogueStrings(root, dialogueContext: true))
             {
                 DialogueSource? source = await BuildSourceAsync(fileCharacterName, key, value, filePath, fileCharacterName, manifest, scanTime, null, sourceRootPath, i18n, canonicalByName, aliasLookupCache);
                 if (source is not null)
@@ -258,6 +274,35 @@ public sealed class DialogueSourceScannerService
         }
 
         return sources;
+    }
+
+    public static DialogueJsonExtractionPreview PreviewJsonExtractionForTests(string rawJson, string filePath)
+    {
+        DialogueParseResult parseResult = TryParseDialogueJson(rawJson);
+        List<(string Key, string Value)> pairs = new();
+        if (parseResult.Document is not null)
+        {
+            using (parseResult.Document)
+            {
+                pairs.AddRange(EnumerateDialogueStrings(parseResult.Document.RootElement, dialogueContext: PathLooksLikeDialogueAsset(filePath))
+                    .Where(pair => !LooksLikeMetadata(pair.Key, pair.Value) && !LooksLikeUnresolvedI18n(pair.Value)));
+            }
+        }
+        else
+        {
+            foreach (Match match in FallbackDialoguePairRegex.Matches(rawJson))
+            {
+                string key = Regex.Unescape(match.Groups["key"].Value);
+                string value = DecodeJsonStringLenient(match.Groups["value"].Value);
+                if (!LooksLikeMetadata(key, value) && !LooksLikeUnresolvedI18n(value))
+                    pairs.Add((key, value));
+            }
+        }
+
+        ZeroLineClassification classification = pairs.Count == 0
+            ? ClassifyZeroLineFile(filePath, rawJson, parseResult)
+            : parseResult.Warning is null ? ZeroLineClassification.HasDialogue : ZeroLineClassification.LenientJsonRecovered;
+        return new DialogueJsonExtractionPreview(parseResult.ParserUsed, classification.ToString(), pairs);
     }
 
     private async Task<DialogueSource?> BuildSourceAsync(
@@ -367,26 +412,77 @@ public sealed class DialogueSourceScannerService
             .ToArray();
     }
 
-    private static IEnumerable<(string Key, string Value)> EnumerateDialogueStrings(JsonElement element, string prefix = "")
+    private static IEnumerable<(string Key, string Value)> EnumerateDialogueStrings(JsonElement element, string prefix = "", bool dialogueContext = false)
     {
+        if (element.ValueKind == JsonValueKind.String)
+        {
+            if (dialogueContext && IsDialogueLikeKey(prefix))
+                yield return (prefix, element.GetString() ?? "");
+            yield break;
+        }
+
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            int index = 0;
+            foreach (JsonElement item in element.EnumerateArray())
+            {
+                string key = $"{prefix}[{index}]";
+                foreach ((string childKey, string childValue) in EnumerateDialogueStrings(item, key, dialogueContext || IsDialogueLikeKey(prefix)))
+                    yield return (childKey, childValue);
+                index++;
+            }
+            yield break;
+        }
+
         if (element.ValueKind != JsonValueKind.Object)
             yield break;
+
+        if (TryGetDialogueObjectPair(element, prefix, out (string Key, string Value) pair))
+        {
+            yield return pair;
+            yield break;
+        }
 
         foreach (JsonProperty property in element.EnumerateObject())
         {
             string key = string.IsNullOrWhiteSpace(prefix) ? property.Name : $"{prefix}/{property.Name}";
-            if (property.Value.ValueKind == JsonValueKind.String)
-            {
-                yield return (key, property.Value.GetString() ?? "");
-                continue;
-            }
+            bool childDialogueContext = dialogueContext
+                || IsDialogueContainer(property.Name)
+                || IsDialogueLikeKey(property.Name)
+                || LooksLikeCharacterSection(property.Name);
 
-            if (property.Value.ValueKind == JsonValueKind.Object && IsDialogueContainer(property.Name))
+            foreach ((string childKey, string childValue) in EnumerateDialogueStrings(property.Value, key, childDialogueContext))
+                yield return (childKey, childValue);
+        }
+    }
+
+    private static bool TryGetDialogueObjectPair(JsonElement element, string prefix, out (string Key, string Value) pair)
+    {
+        pair = default;
+        if (!TryGetStringProperty(element, out string key, "Key", "key", "DialogueKey", "dialogueKey", "Id", "id", "Name", "name"))
+            key = prefix;
+        if (!TryGetStringProperty(element, out string value, "Text", "text", "Value", "value", "Dialogue", "dialogue", "Line", "line"))
+            return false;
+        if (!IsDialogueLikeKey(key) && !IsDialogueLikeKey(prefix))
+            return false;
+
+        pair = (string.IsNullOrWhiteSpace(key) ? prefix : key, value);
+        return true;
+    }
+
+    private static bool TryGetStringProperty(JsonElement element, out string value, params string[] names)
+    {
+        foreach (string name in names)
+        {
+            if (element.TryGetProperty(name, out JsonElement property) && property.ValueKind == JsonValueKind.String)
             {
-                foreach ((string childKey, string childValue) in EnumerateDialogueStrings(property.Value, key))
-                    yield return (childKey, childValue);
+                value = property.GetString() ?? "";
+                return true;
             }
         }
+
+        value = "";
+        return false;
     }
 
     private static bool IsDialogueContainer(string propertyName)
@@ -396,6 +492,32 @@ public sealed class DialogueSourceScannerService
             || propertyName.Equals("Data", StringComparison.OrdinalIgnoreCase)
             || propertyName.Equals("EditData", StringComparison.OrdinalIgnoreCase)
             || propertyName.Equals("Fields", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsDialogueLikeKey(string key)
+    {
+        string leaf = key.Split('/', StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? key;
+        if (string.IsNullOrWhiteSpace(leaf))
+            return false;
+
+        return leaf.Contains("Dialogue", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("Marriage", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("Spouse", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("heart", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("Rainy", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("Indoor", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("AcceptGift", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("Reject", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("spring", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("summer", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("fall", StringComparison.OrdinalIgnoreCase)
+            || leaf.Contains("winter", StringComparison.OrdinalIgnoreCase)
+            || Regex.IsMatch(leaf, @"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun|Rain|Indoor|Outdoor|[A-Za-z]+_\d+|\d+)$", RegexOptions.IgnoreCase);
+    }
+
+    private static bool LooksLikeCharacterSection(string propertyName)
+    {
+        return CleanName(propertyName) is not null;
     }
 
     private static DialogueParseResult TryParseDialogueJson(string rawJson)
@@ -653,6 +775,24 @@ public sealed class DialogueSourceScannerService
             || trimmed.StartsWith("i18n:", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static ZeroLineClassification ClassifyZeroLineFile(string filePath, string rawJson, DialogueParseResult parseResult)
+    {
+        string normalized = filePath.Replace('\\', '/').ToLowerInvariant();
+        string fileName = Path.GetFileName(normalized);
+        if (parseResult.Warning is not null && parseResult.Document is not null)
+            return ZeroLineClassification.LenientJsonRecovered;
+        if (fileName.Equals("content.json", StringComparison.OrdinalIgnoreCase))
+            return ZeroLineClassification.NonDialogueContentFile;
+        if (normalized.Contains("tempactor", StringComparison.OrdinalIgnoreCase) || normalized.Contains("/temp/", StringComparison.OrdinalIgnoreCase))
+            return ZeroLineClassification.TemporaryOrActorFileIgnored;
+        if (fileName.Contains("fake", StringComparison.OrdinalIgnoreCase)
+            || (fileName.Contains("marriagedialogue", StringComparison.OrdinalIgnoreCase) && !rawJson.Contains(":", StringComparison.Ordinal)))
+            return ZeroLineClassification.ExpectedEmptyDialogueVariant;
+        if (PathLooksLikeDialogueAsset(filePath))
+            return ZeroLineClassification.NoDialogueFound;
+        return ZeroLineClassification.NonDialogueContentFile;
+    }
+
     private static string? CharacterNameNearFallbackMatch(string rawText, int matchIndex)
     {
         int start = Math.Max(0, matchIndex - 600);
@@ -887,4 +1027,20 @@ public sealed class DialogueSourceScanSummary
     public int SourcesDeactivated { get; set; }
     public IReadOnlyList<string> Errors { get; set; } = Array.Empty<string>();
     public IReadOnlyList<string> Warnings { get; set; } = Array.Empty<string>();
+    public IReadOnlyList<string> Diagnostics { get; set; } = Array.Empty<string>();
+}
+
+public sealed record DialogueJsonExtractionPreview(
+    string ParserUsed,
+    string Classification,
+    IReadOnlyList<(string Key, string Value)> Pairs);
+
+public enum ZeroLineClassification
+{
+    HasDialogue,
+    ExpectedEmptyDialogueVariant,
+    NonDialogueContentFile,
+    TemporaryOrActorFileIgnored,
+    NoDialogueFound,
+    LenientJsonRecovered
 }

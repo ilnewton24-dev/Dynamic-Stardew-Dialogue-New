@@ -70,6 +70,7 @@ public sealed class DashboardScanRunService
                 status.LastUpdatedAt = completedAt;
                 status.Summary = summary;
                 status.Errors = summary.Errors;
+                status.Warnings = Math.Max(status.Warnings, summary.Warnings.Count);
             });
 
             this.logger.LogInformation(
@@ -81,7 +82,7 @@ public sealed class DashboardScanRunService
                 summary.VanillaCharactersFound,
                 summary.ModdedCharactersFound,
                 duration.TotalMilliseconds,
-                summary.Errors.Count);
+                summary.Warnings.Count);
         }
         catch (Exception ex)
         {

@@ -15,5 +15,6 @@ public sealed class ModScanSummary
     public int CharactersReactivated { get; set; }
     public int CharactersMarkedInactive { get; set; }
     public int ConflictsFound { get; set; }
+    public IReadOnlyList<string> Warnings { get; set; } = Array.Empty<string>();
     public IReadOnlyList<string> Errors { get; set; } = Array.Empty<string>();
 }

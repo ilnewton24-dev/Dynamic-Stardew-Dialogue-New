@@ -126,13 +126,14 @@ public sealed class ModScanCoordinator
                 phaseTimer.Restart();
                 this.Report(progress, "Dialogue source scan", "Dialogue source scan started.", TimeSpan.Zero);
                 DialogueSourceScanSummary dialogueScan = await this.dialogueSourceScanner.ScanAsync(modsFolderPath);
-                errors.AddRange(dialogueScan.Warnings.Take(20).Select(warning => $"Dialogue source warning: {warning}"));
                 errors.AddRange(dialogueScan.Errors.Take(20).Select(error => $"Dialogue source error: {error}"));
                 this.Report(progress, "Dialogue source scan", "Dialogue source scan completed.", phaseTimer.Elapsed, dialogueScan.FilesInspected, 0, dialogueScan.FilesRead, dialogueScan.Warnings.Count, dialogueScan.Errors.Count);
                 this.log?.Invoke(
                     $"Dialogue source scan: {dialogueScan.SourcesFound} lines found from {dialogueScan.FilesRead} files in '{modsFolderPath}'; " +
                     $"{dialogueScan.SourcesDeactivated} stale source(s) from inactive/removed mods deactivated; " +
-                    $"warnings={dialogueScan.Warnings.Count}, errors={dialogueScan.Errors.Count}.");
+                    $"warnings={dialogueScan.Warnings.Count}, recovered={dialogueScan.Diagnostics.Count}, errors={dialogueScan.Errors.Count}.");
+                if (dialogueScan.Warnings.Count > 0)
+                    this.log?.Invoke($"Dialogue source scan diagnostics: {dialogueScan.Warnings.Count} zero-line dialogue file(s) classified. See dashboard scan details for paths.");
             }
             ModScanSummary summary = new()
             {
@@ -149,6 +150,7 @@ public sealed class ModScanCoordinator
                 CharactersReactivated = syncSummary.CharactersReactivated,
                 CharactersMarkedInactive = syncSummary.CharactersMarkedInactive,
                 ConflictsFound = await this.conflictRepository.CountUnreviewedAsync(),
+                Warnings = Array.Empty<string>(),
                 Errors = errors
             };
 

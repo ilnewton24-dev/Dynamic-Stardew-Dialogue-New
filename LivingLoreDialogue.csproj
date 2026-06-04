@@ -18,9 +18,13 @@
        assets out of the SMAPI mod build; they are published separately by package-local-mod.ps1. -->
   <ItemGroup>
     <Compile Remove="LivingLoreDialogue.Web\**\*.cs" />
+    <Compile Remove="LivingLoreDialogue.Tests\**\*.cs" />
     <Content Remove="LivingLoreDialogue.Web\**" />
+    <Content Remove="LivingLoreDialogue.Tests\**" />
     <None Remove="LivingLoreDialogue.Web\**" />
+    <None Remove="LivingLoreDialogue.Tests\**" />
     <EmbeddedResource Remove="LivingLoreDialogue.Web\**" />
+    <EmbeddedResource Remove="LivingLoreDialogue.Tests\**" />
   </ItemGroup>
 
   <ItemGroup>
