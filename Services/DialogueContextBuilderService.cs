@@ -183,7 +183,7 @@ public sealed class DialogueContextBuilderService
             RecentGeneratedDialogue = recentGeneratedDialogue
         };
 
-        IReadOnlyList<DialogueSource> relevantDialogueSources =
+        IReadOnlyList<ScoredDialogueSource> relevantDialogueSources =
             this.contextSelectionService.SelectRelevantDialogueSources(context, preliminaryLore, limit: 10);
         CharacterVoiceProfile voiceProfile =
             this.contextSelectionService.BuildVoiceProfile(dialogueSources, summary);

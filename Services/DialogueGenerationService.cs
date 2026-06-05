@@ -133,7 +133,7 @@ public sealed class DialogueGenerationService
             {
                 CanonicalCharacterId = packet.Lore.CanonicalCharacter.Id,
                 DialogueKey = string.IsNullOrWhiteSpace(context.Topic) ? "generated" : context.Topic,
-                OriginalDialogueSourceId = packet.DialogueSources.FirstOrDefault()?.Id,
+                OriginalDialogueSourceId = packet.DialogueSources.FirstOrDefault()?.Source.Id,
                 GeneratedText = dialogue.Dialogue,
                 PromptUsed = prompt,
                 SaveContextSnapshot = System.Text.Json.JsonSerializer.Serialize(packet.SaveContext),

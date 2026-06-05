@@ -135,10 +135,19 @@ public sealed class PromptBuilder
         builder.AppendLine();
 
         string playerNameForClean = string.IsNullOrWhiteSpace(lore.SaveContext.PlayerName) ? "you" : lore.SaveContext.PlayerName;
-        AppendSection(builder, "Relevant dialogue examples selected for this scene", lore.RelevantDialogueSources
-            .Select(source => (Key: source.DialogueKey, Mod: source.SourceModId ?? "vanilla", Cleaned: DialogueContextSelectionService.CleanDialogueText(source.RawText, playerNameForClean)))
-            .Where(item => !string.IsNullOrWhiteSpace(item.Cleaned))
-            .Select(item => $"{item.Key} [{item.Mod}]: {item.Cleaned}"));
+        IEnumerable<string> exampleLines = lore.RelevantDialogueSources
+            .Select(scored =>
+            {
+                string cleaned = DialogueContextSelectionService.CleanDialogueText(scored.Source.RawText, playerNameForClean);
+                if (string.IsNullOrWhiteSpace(cleaned)) return null;
+                string tag = scored.IsVoiceOnlyFallback ? "[VOICE]" : "[SCENE]";
+                return $"{tag} {scored.Source.DialogueKey} [{scored.Source.SourceModId ?? "vanilla"}]: {cleaned}";
+            })
+            .Where(item => item is not null)
+            .Select(item => item!);
+        if (lore.RelevantDialogueSources.Any(s => s.IsVoiceOnlyFallback))
+            exampleLines = exampleLines.Append("Note: [VOICE] examples calibrate character voice only — do not use their topic as scene content.");
+        AppendSection(builder, "Relevant dialogue examples selected for this scene", exampleLines);
         AppendSection(builder, "User lore overrides", lore.UserOverrides.Select(userOverride =>
             $"{userOverride.OverrideType}.{userOverride.FieldName}: {userOverride.OverrideValue}"));
         AppendSection(builder, "Voice rules", lore.VoiceRules.Select(rule => rule.RuleText));

@@ -15,7 +15,7 @@ public sealed class DialogueLoreBundle
     /// </summary>
     public IReadOnlyList<CharacterSource> CharacterSourcesAll { get; init; } = Array.Empty<CharacterSource>();
     public IReadOnlyList<DialogueSource> DialogueSources { get; init; } = Array.Empty<DialogueSource>();
-    public IReadOnlyList<DialogueSource> RelevantDialogueSources { get; init; } = Array.Empty<DialogueSource>();
+    public IReadOnlyList<ScoredDialogueSource> RelevantDialogueSources { get; init; } = Array.Empty<ScoredDialogueSource>();
     public DialogueSourceSummary? DialogueSummary { get; init; }
     public CharacterVoiceProfile VoiceProfile { get; init; } = new();
     public SaveFileContextSnapshot SaveContext { get; init; } = new();

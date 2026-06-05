@@ -80,13 +80,17 @@ public sealed class DialogueExplanationService
             item.Notes
         });
 
-        var dialogueSources = packet.DialogueSources.Select(source => new
+        var dialogueSources = packet.DialogueSources.Select(scored => new
         {
-            file = source.FilePath,
-            mod = source.SourceModId,
-            key = source.DialogueKey,
-            asset = source.AssetName,
-            text = source.RawText
+            file = scored.Source.FilePath,
+            mod = scored.Source.SourceModId,
+            key = scored.Source.DialogueKey,
+            asset = scored.Source.AssetName,
+            text = scored.Source.RawText,
+            score = scored.TotalScore,
+            sceneScore = scored.SceneScore,
+            breakdown = scored.ScoreBreakdown,
+            isVoiceOnly = scored.IsVoiceOnlyFallback
         });
 
         // Use the full set (including inactive historical sources) so the explanation page can show

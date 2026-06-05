@@ -49,13 +49,13 @@ public sealed class DialogueContextSelectionService
         "don't", "will", "would", "could", "should", "they", "them", "our", "are", "was", "were"
     };
 
-    public IReadOnlyList<DialogueSource> SelectRelevantDialogueSources(
+    public IReadOnlyList<ScoredDialogueSource> SelectRelevantDialogueSources(
         DialogueContext context,
         DialogueLoreBundle lore,
         int limit = 8)
     {
         if (lore.DialogueSources.Count == 0)
-            return Array.Empty<DialogueSource>();
+            return Array.Empty<ScoredDialogueSource>();
 
         string relationshipState = NormalizeRelationshipState(lore.SaveContext.RelationshipState, context.FriendshipLevel);
         string playerName = string.IsNullOrWhiteSpace(lore.SaveContext.PlayerName) ? "you" : lore.SaveContext.PlayerName;
@@ -70,21 +70,25 @@ public sealed class DialogueContextSelectionService
             $"{usable.Count} usable after text-quality filter.");
 
         if (usable.Count == 0)
-            return Array.Empty<DialogueSource>();
+            return Array.Empty<ScoredDialogueSource>();
 
         // Score all usable sources and take the top ones.
-        // No minimum score threshold — always return something if sources exist.
-        IReadOnlyList<DialogueSource> selected = usable
-            .Select(source => new { Source = source, Score = ScoreSource(source, context, lore, relationshipState) })
-            .OrderByDescending(item => item.Score)
+        IReadOnlyList<ScoredDialogueSource> selected = usable
+            .Select(source =>
+            {
+                var (total, scene, breakdown, voiceOnly) =
+                    ScoreSourceWithBreakdown(source, context, lore, relationshipState);
+                return new ScoredDialogueSource(source, total, scene, breakdown, voiceOnly);
+            })
+            .OrderByDescending(item => item.TotalScore)
             .ThenByDescending(item => item.Source.SourcePriority)
             .ThenBy(item => item.Source.DialogueKey)
             .Take(limit)
-            .Select(item => item.Source)
             .ToArray();
 
         System.Diagnostics.Debug.WriteLine(
-            $"[Selection] '{context.CharacterName}': selected {selected.Count} example(s) (limit={limit}).");
+            $"[Selection] '{context.CharacterName}': selected {selected.Count} example(s) (limit={limit}), " +
+            $"{selected.Count(s => s.IsVoiceOnlyFallback)} voice-only.");
         return selected;
     }
 
@@ -156,34 +160,200 @@ public sealed class DialogueContextSelectionService
             .ToArray();
     }
 
-    private static int ScoreSource(
-        DialogueSource source,
-        DialogueContext context,
-        DialogueLoreBundle lore,
-        string relationshipState)
+    // ── Scoring ──────────────────────────────────────────────────────────────
+
+    internal static (int TotalScore, int SceneScore, string Breakdown, bool IsVoiceOnlyFallback)
+        ScoreSourceWithBreakdown(
+            DialogueSource source,
+            DialogueContext context,
+            DialogueLoreBundle lore,
+            string relationshipState)
     {
-        int score = source.SourcePriority;
+        var parts = new List<string>();
+        int sceneScore = 0;
+
         string key = source.DialogueKey;
         string combined = $"{source.DialogueKey} {source.RawText} {source.Conditions} {source.AssetName}";
 
+        // ── Existing positive bonuses ──────────────────────────────────────
         if (Matches(source.Season, context.Season) || Contains(combined, context.Season))
-            score += 35;
-        if (Matches(source.Weather, context.Weather) || Contains(combined, context.Weather))
-            score += 30;
-        if (Matches(source.Location, context.Location) || Contains(combined, context.Location))
-            score += 28;
-        if (source.HeartLevel is int hearts)
-            score += Math.Max(0, 24 - Math.Abs(hearts - context.FriendshipLevel) * 4);
-        if (IsRelationshipMatch(source.RelationshipState, relationshipState) || Contains(combined, relationshipState))
-            score += 35;
-        if (Contains(combined, context.Topic))
-            score += 42;
-        if (lore.Events.Any(evt => Contains(combined, evt.Title) || Contains(combined, evt.Description)))
-            score += 18;
+        { sceneScore += 35; parts.Add("+Season:35"); }
 
-        score += TopicAffinityScore(context.Topic, key, combined, relationshipState);
-        return score;
+        if (Matches(source.Weather, context.Weather) || Contains(combined, context.Weather))
+        { sceneScore += 30; parts.Add("+Weather:30"); }
+
+        if (Matches(source.Location, context.Location) || Contains(combined, context.Location))
+        { sceneScore += 28; parts.Add("+Location:28"); }
+
+        if (source.HeartLevel is int hearts)
+        {
+            int heartBonus = Math.Max(0, 24 - Math.Abs(hearts - context.FriendshipLevel) * 4);
+            if (heartBonus > 0) { sceneScore += heartBonus; parts.Add($"+Hearts:{heartBonus}"); }
+        }
+
+        if (IsRelationshipMatch(source.RelationshipState, relationshipState) || Contains(combined, relationshipState))
+        { sceneScore += 35; parts.Add("+Relationship:35"); }
+
+        if (Contains(combined, context.Topic))
+        { sceneScore += 42; parts.Add("+Topic:42"); }
+
+        if (lore.Events.Any(evt => Contains(combined, evt.Title) || Contains(combined, evt.Description)))
+        { sceneScore += 18; parts.Add("+Event:18"); }
+
+        int affinity = TopicAffinityScore(context.Topic, key, combined, relationshipState);
+        if (affinity > 0) { sceneScore += affinity; parts.Add($"+Affinity:{affinity}"); }
+
+        // ── New: weekday bonus ─────────────────────────────────────────────
+        if (lore.SaveContext.Day > 0)
+        {
+            string weekday = GetWeekdayAbbr(lore.SaveContext.Day);
+            if (Contains(key, weekday))
+            { sceneScore += 15; parts.Add("+Weekday:15"); }
+        }
+
+        // ── New: neutral general-line bonus ────────────────────────────────
+        bool isGeneralTopic = string.IsNullOrWhiteSpace(context.Topic) ||
+                              context.Topic.Equals("general", StringComparison.OrdinalIgnoreCase);
+        if (isGeneralTopic && IsNeutralKey(key, source.FilePath))
+        { sceneScore += 10; parts.Add("+Neutral:10"); }
+
+        // ── Scene-mismatch penalties ───────────────────────────────────────
+        bool isGiftTopic = context.Topic.Contains("gift", StringComparison.OrdinalIgnoreCase) ||
+                           context.Topic.Contains("birthday", StringComparison.OrdinalIgnoreCase);
+        bool isSpouseState = relationshipState is "spouse" or "married";
+        bool isDatingState = relationshipState is "dating";
+        string? currentFestival = lore.SaveContext.FestivalOrSpecialDay;
+
+        bool spouseKeyDetected = IsSpouseSpecificKey(key, source.FilePath);
+        bool datingKeyDetected = IsDatingKey(key);
+
+        if (IsAcceptGiftKey(key) && !isGiftTopic)
+        { sceneScore -= 60; parts.Add("-AcceptGift:60"); }
+
+        if (IsItemGiftKey(key) && !isGiftTopic)
+        { sceneScore -= 50; parts.Add("-ItemGift:50"); }
+
+        if (IsRejectionKey(key) && !isGiftTopic)
+        { sceneScore -= 60; parts.Add("-Reject:60"); }
+
+        // Bad_* = spouse bad-mood dialogue; only relevant when the player is married to this NPC.
+        if (IsBadMoodKey(key) && !isSpouseState)
+        { sceneScore -= 40; parts.Add("-BadMood:40"); }
+
+        // Spouse/marriage keys and structured field — avoid double-penalising the same source.
+        if (spouseKeyDetected && !isSpouseState)
+        { sceneScore -= 70; parts.Add("-SpouseMismatch:70"); }
+        else if (!spouseKeyDetected &&
+                 source.RelationshipState != null &&
+                 IsRelationshipMatch(source.RelationshipState, "spouse") &&
+                 !isSpouseState)
+        { sceneScore -= 50; parts.Add("-SpouseRelField:50"); }
+
+        // Dating/flirt keys and structured field.
+        if (datingKeyDetected && !isDatingState && !isSpouseState)
+        { sceneScore -= 50; parts.Add("-DatingMismatch:50"); }
+        else if (!datingKeyDetected &&
+                 source.RelationshipState != null &&
+                 IsRelationshipMatch(source.RelationshipState, "dating") &&
+                 !isDatingState && !isSpouseState)
+        { sceneScore -= 40; parts.Add("-DatingRelField:40"); }
+
+        if (IsFestivalKey(key) && !IsFestivalMatch(key, currentFestival))
+        { sceneScore -= 45; parts.Add("-FestivalMismatch:45"); }
+
+        // Explicit location mismatch (source.Location field set, but doesn't match current location).
+        if (!string.IsNullOrWhiteSpace(source.Location) &&
+            !Matches(source.Location, context.Location) &&
+            !Contains(context.Location, source.Location))
+        { sceneScore -= 25; parts.Add("-LocationMismatch:25"); }
+
+        bool isVoiceOnly = sceneScore < 0;
+        int totalScore = source.SourcePriority + sceneScore;
+
+        string breakdown = parts.Count > 0
+            ? $"Priority:{source.SourcePriority} | {string.Join(" | ", parts)} | Scene:{sceneScore} | Total:{totalScore}{(isVoiceOnly ? " [VOICE-ONLY]" : "")}"
+            : $"Priority:{source.SourcePriority} | Scene:0 | Total:{totalScore}";
+
+        return (totalScore, sceneScore, breakdown, isVoiceOnly);
     }
+
+    // ── Key-pattern detectors ─────────────────────────────────────────────────
+
+    /// <summary>Gift-acceptance keys, with or without quality/item suffix.</summary>
+    internal static bool IsAcceptGiftKey(string key) =>
+        key.Contains("AcceptGift", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("AcceptBirthdayGift", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Item-specific gift-override keys not covered by AcceptGift patterns.</summary>
+    internal static bool IsItemGiftKey(string key) =>
+        key.StartsWith("gifted_", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("ItemGifted", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("gift_item", StringComparison.OrdinalIgnoreCase);
+
+    internal static bool IsRejectionKey(string key) =>
+        key.StartsWith("Reject", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("_Reject", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Bad_* = spouse bad-mood dialogue from MarriageDialogue files.</summary>
+    internal static bool IsBadMoodKey(string key) =>
+        key.StartsWith("Bad_", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Key or file path indicates spouse/marriage-specific content.</summary>
+    internal static bool IsSpouseSpecificKey(string key, string? filePath) =>
+        key.StartsWith("Indoor_", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("spouse", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("marriage", StringComparison.OrdinalIgnoreCase) ||
+        filePath?.Contains("MarriageDialogue", StringComparison.OrdinalIgnoreCase) == true ||
+        filePath?.Contains("spousePatioDialogue", StringComparison.OrdinalIgnoreCase) == true;
+
+    internal static bool IsDatingKey(string key) =>
+        key.Contains("dating", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("flirt", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("romance", StringComparison.OrdinalIgnoreCase);
+
+    private static readonly HashSet<string> FestivalKeyFragments = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "EggFestival", "FlowerDance", "Luau", "JelliesParty", "MoonlightJellies",
+        "Fair", "SpiritsEve", "FestivalOfIce", "WinterStar", "WinterFest",
+        "egg_festival", "flower_dance", "spirit_eve", "festival_of_ice", "winter_star"
+    };
+
+    internal static bool IsFestivalKey(string key) =>
+        FestivalKeyFragments.Any(f => key.Contains(f, StringComparison.OrdinalIgnoreCase)) ||
+        key.StartsWith("festival_", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsFestivalMatch(string key, string? currentFestival)
+    {
+        if (string.IsNullOrWhiteSpace(currentFestival)) return false;
+        return key.Contains(currentFestival, StringComparison.OrdinalIgnoreCase) ||
+               FestivalKeyFragments.Any(f =>
+                   key.Contains(f, StringComparison.OrdinalIgnoreCase) &&
+                   currentFestival.Contains(f, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>A neutral key has no scene-specific category markers.</summary>
+    internal static bool IsNeutralKey(string key, string? filePath) =>
+        !IsAcceptGiftKey(key) && !IsItemGiftKey(key) && !IsRejectionKey(key) &&
+        !IsBadMoodKey(key) && !IsSpouseSpecificKey(key, filePath) &&
+        !IsDatingKey(key) && !IsFestivalKey(key);
+
+    // ── Weekday helper ────────────────────────────────────────────────────────
+
+    /// <summary>SDV day 1 = Monday. Returns 3-letter abbreviation.</summary>
+    internal static string GetWeekdayAbbr(int dayOfMonth) =>
+        ((dayOfMonth - 1) % 7) switch
+        {
+            0 => "Mon",
+            1 => "Tue",
+            2 => "Wed",
+            3 => "Thu",
+            4 => "Fri",
+            5 => "Sat",
+            6 => "Sun",
+            _ => ""
+        };
+
+    // ── Existing helpers ──────────────────────────────────────────────────────
 
     private static int TopicAffinityScore(string topic, string key, string combined, string relationshipState)
     {

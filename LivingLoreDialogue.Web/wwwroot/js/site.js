@@ -999,11 +999,19 @@ async function loadExplanation(id) {
     const t = data.trace;
     title.textContent = line ? `Explanation — ${line.characterName}` : "Explanation";
 
-    const sources = (t.dialogueSourcesUsed || []).map(s => `
-        <li><strong>${escapeHtml(s.key || "(no key)")}</strong>
+    const sources = (t.dialogueSourcesUsed || []).map(s => {
+        const roleTag = s.isVoiceOnly
+            ? `<span style="color:#999;font-size:0.8em">[VOICE]</span>`
+            : `<span style="color:#4a9;font-size:0.8em">[SCENE]</span>`;
+        const scoreInfo = s.score !== undefined
+            ? `<br><small style="color:#888">score: ${s.score} (scene: ${s.sceneScore}) — ${escapeHtml(s.breakdown || "")}</small>`
+            : "";
+        return `<li><strong>${escapeHtml(s.key || "(no key)")}</strong> ${roleTag}
             — mod: ${escapeHtml(s.mod || "unknown")}
             <br><small>file: ${escapeHtml(s.file || "n/a")}</small>
-            ${s.text ? `<br><small>${escapeHtml(s.text)}</small>` : ""}</li>`).join("");
+            ${s.text ? `<br><small>${escapeHtml(s.text)}</small>` : ""}
+            ${scoreInfo}</li>`;
+    }).join("");
 
     const memories = (t.memoriesUsed || []).map(m =>
         `<li>[importance ${escapeHtml(m.importance)}] ${escapeHtml(m.memoryText)}</li>`).join("");
@@ -1271,8 +1279,12 @@ function renderSimulationReport(data) {
     const validation = (report.validation || []).map(v =>
         `<li class="${v.passed ? "rule-pass" : "rule-fail"}">${v.passed ? "✓" : "✗"} ${escapeHtml(v.name)} — ${escapeHtml(v.detail || "")}</li>`).join("");
 
-    const sources = explanation ? (explanation.dialogueSourcesUsed || []).map(s =>
-        `<li><strong>${escapeHtml(s.key || "(no key)")}</strong> — ${escapeHtml(s.mod || "unknown")} <small>${escapeHtml(s.file || "")}</small></li>`).join("") : "";
+    const sources = explanation ? (explanation.dialogueSourcesUsed || []).map(s => {
+        const roleTag = s.isVoiceOnly
+            ? `<span style="color:#999;font-size:0.8em">[VOICE]</span>`
+            : `<span style="color:#4a9;font-size:0.8em">[SCENE]</span>`;
+        return `<li><strong>${escapeHtml(s.key || "(no key)")}</strong> ${roleTag} — ${escapeHtml(s.mod || "unknown")} <small>${escapeHtml(s.file || "")}</small></li>`;
+    }).join("") : "";
     const memories = explanation ? (explanation.memoriesUsed || []).map(m =>
         `<li>${escapeHtml(m.memoryText)}</li>`).join("") : "";
 
