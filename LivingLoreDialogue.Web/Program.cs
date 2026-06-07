@@ -35,6 +35,13 @@ options.SeedPath = seedPath;
 options.ApiKeyFilePath = Path.GetFullPath(options.ApiKeyFilePath, contentRoot);
 options.ResolvedOpenAiApiKey = ResolveOpenAiApiKey(options, builder.Configuration);
 builder.Services.AddSingleton(options);
+builder.Services.AddSingleton(new ScanOptions
+{
+    ScanTimeoutSeconds = options.ScanTimeoutSeconds,
+    PerFileParseTimeoutMs = options.PerFileParseTimeoutMs,
+    EnableScanCache = options.EnableScanCache,
+    MaxDialogueFilesPerScan = options.MaxDialogueFilesPerScan
+});
 builder.Services.AddSingleton(new SqliteConnectionFactory(databasePath));
 builder.Services.AddScoped<DatabaseInitializer>();
 builder.Services.AddScoped<CharacterRepository>();
@@ -53,6 +60,7 @@ builder.Services.AddScoped<ScanHistoryRepository>();
 builder.Services.AddScoped<CharacterValidationRepository>();
 builder.Services.AddScoped<CanonicalCharacterRepository>();
 builder.Services.AddScoped<DialogueSourceRepository>();
+builder.Services.AddScoped<ScanFileCacheRepository>();
 builder.Services.AddScoped<GeneratedDialogueOverrideRepository>();
 builder.Services.AddScoped<DialogueGenerationTraceRepository>();
 builder.Services.AddScoped<TestScenarioRepository>();
@@ -645,6 +653,48 @@ app.MapPost("/api/player-profiles", async (PlayerProfileRequest request, PlayerP
     return Results.Ok(new { id });
 });
 
+app.MapPost("/api/player-profiles/autocomplete", async (
+    PlayerProfileAutocompleteRequest request,
+    OpenAiDialogueService openAi,
+    LivingLoreWebOptions webOptions,
+    ILoggerFactory loggerFactory,
+    CancellationToken cancellationToken) =>
+{
+    ILogger logger = loggerFactory.CreateLogger("PlayerProfileAutocompleteEndpoint");
+    string concept = request.Concept?.Trim() ?? "";
+    if (string.IsNullOrWhiteSpace(concept))
+        return Results.BadRequest(new { error = "Profile concept is required." });
+    if (concept.Length > 500)
+        return Results.BadRequest(new { error = "Profile concept must be 500 characters or fewer." });
+    if (!openAi.HasApiKey)
+        return Results.BadRequest(new { error = "OpenAI API key is not configured." });
+
+    try
+    {
+        PlayerProfileAutocompleteResult generated = await openAi.GeneratePlayerProfileAsync(concept, cancellationToken);
+        PlayerProfileAutocompleteResult merged = MergeGeneratedProfile(generated, request.ExistingProfile, request.OverwriteExisting);
+
+        logger.LogInformation(
+            "Generated player profile draft. model={Model}; timestamp={Timestamp:o}; concept={Concept}; generatedFields={GeneratedFields}",
+            webOptions.OpenAiModel,
+            DateTime.UtcNow,
+            concept,
+            JsonSerializer.Serialize(generated));
+
+        return Results.Ok(new
+        {
+            success = true,
+            profile = merged,
+            warnings = Array.Empty<string>()
+        });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Player profile autocomplete failed for concept: {Concept}", concept);
+        return Results.BadRequest(new { error = $"Profile generation failed: {ex.Message}" });
+    }
+});
+
 app.MapPut("/api/player-profiles/{id:long}", async (long id, PlayerProfileRequest request, PlayerProfileRepository repo) =>
 {
     PlayerProfile? existing = await repo.GetByIdAsync(id);
@@ -794,21 +844,45 @@ app.MapGet("/api/settings", async (LivingLoreWebOptions webOptions, AppSettingsR
         availableModels = KnownOpenAiModels(),
         gamePath = saved.GetValueOrDefault("GamePath") ?? webOptions.GamePath,
         modsFolderPath = saved.GetValueOrDefault("ModsFolderPath") ?? webOptions.ModsFolderPath,
+        scanTimeoutSeconds = int.TryParse(saved.GetValueOrDefault("ScanTimeoutSeconds"), out int scanTimeoutSeconds)
+            ? scanTimeoutSeconds
+            : webOptions.ScanTimeoutSeconds,
+        perFileParseTimeoutMs = int.TryParse(saved.GetValueOrDefault("PerFileParseTimeoutMs"), out int perFileParseTimeoutMs)
+            ? perFileParseTimeoutMs
+            : webOptions.PerFileParseTimeoutMs,
+        enableScanCache = bool.TryParse(saved.GetValueOrDefault("EnableScanCache"), out bool enableScanCache)
+            ? enableScanCache
+            : webOptions.EnableScanCache,
+        maxDialogueFilesPerScan = int.TryParse(saved.GetValueOrDefault("MaxDialogueFilesPerScan"), out int maxDialogueFilesPerScan)
+            ? maxDialogueFilesPerScan
+            : webOptions.MaxDialogueFilesPerScan,
         enableLiveInGameDialogueGeneration = bool.TryParse(saved.GetValueOrDefault("EnableLiveInGameDialogueGeneration"), out bool enabled)
             ? enabled
             : webOptions.EnableLiveInGameDialogueGeneration
     });
 });
-app.MapPost("/api/settings", async (SettingsRequest request, AppSettingsRepository repo, LivingLoreWebOptions webOptions) =>
+app.MapPost("/api/settings", async (SettingsRequest request, AppSettingsRepository repo, LivingLoreWebOptions webOptions, ScanOptions scanOptions) =>
 {
     await repo.SetAsync("OpenAiModel", request.OpenAiModel);
     await repo.SetAsync("GamePath", request.GamePath ?? "");
     await repo.SetAsync("ModsFolderPath", request.ModsFolderPath);
     await repo.SetAsync("EnableLiveInGameDialogueGeneration", request.EnableLiveInGameDialogueGeneration.ToString());
+    await repo.SetAsync("ScanTimeoutSeconds", request.ScanTimeoutSeconds.ToString());
+    await repo.SetAsync("PerFileParseTimeoutMs", request.PerFileParseTimeoutMs.ToString());
+    await repo.SetAsync("EnableScanCache", request.EnableScanCache.ToString());
+    await repo.SetAsync("MaxDialogueFilesPerScan", request.MaxDialogueFilesPerScan?.ToString() ?? "");
     webOptions.OpenAiModel = request.OpenAiModel;
     webOptions.GamePath = request.GamePath ?? "";
     webOptions.ModsFolderPath = request.ModsFolderPath;
     webOptions.EnableLiveInGameDialogueGeneration = request.EnableLiveInGameDialogueGeneration;
+    webOptions.ScanTimeoutSeconds = request.ScanTimeoutSeconds;
+    webOptions.PerFileParseTimeoutMs = request.PerFileParseTimeoutMs;
+    webOptions.EnableScanCache = request.EnableScanCache;
+    webOptions.MaxDialogueFilesPerScan = request.MaxDialogueFilesPerScan;
+    scanOptions.ScanTimeoutSeconds = request.ScanTimeoutSeconds;
+    scanOptions.PerFileParseTimeoutMs = request.PerFileParseTimeoutMs;
+    scanOptions.EnableScanCache = request.EnableScanCache;
+    scanOptions.MaxDialogueFilesPerScan = request.MaxDialogueFilesPerScan;
     return Results.NoContent();
 });
 
@@ -1055,6 +1129,35 @@ static PlayerProfile ToPlayerProfile(PlayerProfileRequest request, long id) => n
     IsActive = true
 };
 
+static PlayerProfileAutocompleteResult MergeGeneratedProfile(
+    PlayerProfileAutocompleteResult generated,
+    PlayerProfileDraft? existing,
+    bool overwriteExisting)
+{
+    if (overwriteExisting || existing is null)
+        return generated;
+
+    return generated with
+    {
+        ProfileName = KeepExisting(existing.ProfileName, generated.ProfileName),
+        Description = KeepExisting(existing.Description, generated.Description),
+        Backstory = KeepExisting(existing.Backstory, generated.Backstory),
+        Personality = KeepExisting(existing.Personality, generated.Personality),
+        RoleplayStyle = KeepExisting(existing.RoleplayStyle, generated.RoleplayStyle),
+        PreferredDialogueTone = KeepExisting(FirstExisting(existing.PreferredDialogueTone, existing.PreferredTone), generated.PreferredDialogueTone),
+        ImportantHistory = KeepExisting(existing.ImportantHistory, generated.ImportantHistory),
+        CurrentGoals = KeepExisting(existing.CurrentGoals, generated.CurrentGoals),
+        RelationshipNotes = KeepExisting(existing.RelationshipNotes, generated.RelationshipNotes),
+        CustomLore = KeepExisting(existing.CustomLore, generated.CustomLore)
+    };
+}
+
+static string KeepExisting(string? existing, string generated) =>
+    string.IsNullOrWhiteSpace(existing) ? generated : existing.Trim();
+
+static string? FirstExisting(params string?[] values) =>
+    values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+
 static TestScenario ToScenario(ScenarioRequest request, long id) => new()
 {
     Id = id,
@@ -1170,6 +1273,10 @@ namespace LivingLoreDialogue.Web
         public string GamePath { get; set; } = "";
         public string ModsFolderPath { get; set; } = "";
         public bool EnableLiveInGameDialogueGeneration { get; set; } = true;
+        public int ScanTimeoutSeconds { get; set; } = 90;
+        public int PerFileParseTimeoutMs { get; set; } = 1000;
+        public bool EnableScanCache { get; set; } = true;
+        public int? MaxDialogueFilesPerScan { get; set; }
         public int MaxRecentMemories { get; set; } = 8;
     }
 
@@ -1242,7 +1349,15 @@ namespace LivingLoreDialogue.Web
         long? ActivePlayerProfileId = null,
         string? RequestSource = null,
         SaveFileContextSnapshot? SaveContext = null);
-    public sealed record SettingsRequest(string OpenAiModel, string? GamePath, string ModsFolderPath, bool EnableLiveInGameDialogueGeneration);
+    public sealed record SettingsRequest(
+        string OpenAiModel,
+        string? GamePath,
+        string ModsFolderPath,
+        bool EnableLiveInGameDialogueGeneration,
+        int ScanTimeoutSeconds,
+        int PerFileParseTimeoutMs,
+        bool EnableScanCache,
+        int? MaxDialogueFilesPerScan);
     public sealed record ModelRequest(string Model);
     public sealed record SimulateRequest(long ScenarioId, string CharacterName, string Topic);
     public sealed record MergeDuplicatesRequest(string Name, long PrimaryCharacterId);
@@ -1261,6 +1376,22 @@ namespace LivingLoreDialogue.Web
         string CurrentGoals,
         string RelationshipNotes,
         string CustomLore);
+    public sealed record PlayerProfileAutocompleteRequest(
+        string? Concept,
+        PlayerProfileDraft? ExistingProfile,
+        bool OverwriteExisting = false);
+    public sealed record PlayerProfileDraft(
+        string? ProfileName,
+        string? Description,
+        string? Backstory,
+        string? Personality,
+        string? RoleplayStyle,
+        string? PreferredTone,
+        string? PreferredDialogueTone,
+        string? ImportantHistory,
+        string? CurrentGoals,
+        string? RelationshipNotes,
+        string? CustomLore);
     public sealed record PlayerProfileRelationshipRequest(
         long CanonicalCharacterId,
         string RelationshipType,

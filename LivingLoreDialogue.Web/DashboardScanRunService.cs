@@ -64,12 +64,19 @@ public sealed class DashboardScanRunService
 
             Update(scanRunId, status =>
             {
-                status.State = summary.Success ? "Completed" : "Failed";
-                status.Message = summary.Success ? "Scan completed." : "Scan completed with errors.";
+                status.State = summary.IsPartial ? "Partial" : summary.Success ? "Completed" : "Failed";
+                status.Message = summary.IsPartial
+                    ? $"Partial scan saved. Timed out during {summary.TimedOutPhase}."
+                    : summary.Success ? "Scan completed." : "Scan completed with errors.";
                 status.CompletedAt = completedAt;
                 status.LastUpdatedAt = completedAt;
                 status.Summary = summary;
                 status.Errors = summary.Errors;
+                status.IsPartial = summary.IsPartial;
+                status.TimedOutPhase = summary.TimedOutPhase;
+                status.LastFileProcessed = summary.LastFileProcessed;
+                status.FilesRemaining = summary.FilesRemaining;
+                status.DatabaseStatePartial = summary.DatabaseStatePartial;
                 status.Warnings = Math.Max(status.Warnings, summary.Warnings.Count);
             });
 
@@ -117,6 +124,15 @@ public sealed class DashboardScanRunService
             status.LastUpdatedAt = DateTime.UtcNow;
             status.LastPhase = progress;
             status.FilesInspected = Math.Max(status.FilesInspected, progress.FilesInspected);
+            status.TotalFilesQueued = Math.Max(status.TotalFilesQueued, progress.TotalFilesQueued);
+            status.FilesScanned = Math.Max(status.FilesScanned, progress.FilesScanned);
+            status.FilesSkippedFromCache = Math.Max(status.FilesSkippedFromCache, progress.FilesSkippedFromCache);
+            status.FilesFailed = Math.Max(status.FilesFailed, progress.FilesFailed);
+            status.FilesRemaining = Math.Max(status.FilesRemaining, progress.FilesRemaining);
+            status.LastFileProcessed = string.IsNullOrWhiteSpace(progress.LastFileProcessed) ? status.LastFileProcessed : progress.LastFileProcessed;
+            status.IsPartial = status.IsPartial || progress.DatabaseStatePartial;
+            status.TimedOutPhase = progress.TimedOut ? progress.Phase : status.TimedOutPhase;
+            status.DatabaseStatePartial = status.DatabaseStatePartial || progress.DatabaseStatePartial;
             status.CharactersFound = Math.Max(status.CharactersFound, progress.CharactersFound);
             status.DialogueFilesFound = Math.Max(status.DialogueFilesFound, progress.DialogueFilesFound);
             status.Warnings = Math.Max(status.Warnings, progress.Warnings);
@@ -149,6 +165,15 @@ public sealed class DashboardScanRunStatus
     public ModScanSummary? Summary { get; set; }
     public ScanPhaseProgress? LastPhase { get; set; }
     public int FilesInspected { get; set; }
+    public int TotalFilesQueued { get; set; }
+    public int FilesScanned { get; set; }
+    public int FilesSkippedFromCache { get; set; }
+    public int FilesFailed { get; set; }
+    public int FilesRemaining { get; set; }
+    public bool IsPartial { get; set; }
+    public string TimedOutPhase { get; set; } = "";
+    public string LastFileProcessed { get; set; } = "";
+    public bool DatabaseStatePartial { get; set; }
     public int CharactersFound { get; set; }
     public int DialogueFilesFound { get; set; }
     public int Warnings { get; set; }

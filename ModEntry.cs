@@ -152,6 +152,13 @@ public sealed class ModEntry : Mod
             CharacterValidationRepository characterValidationRepository = new(connectionFactory);
             CanonicalCharacterRepository canonicalCharacterRepository = new(connectionFactory);
             DialogueSourceRepository dialogueSourceRepository = new(connectionFactory);
+            ScanOptions scanOptions = new()
+            {
+                ScanTimeoutSeconds = this.config.ScanTimeoutSeconds,
+                PerFileParseTimeoutMs = this.config.PerFileParseTimeoutMs,
+                EnableScanCache = this.config.EnableScanCache,
+                MaxDialogueFilesPerScan = this.config.MaxDialogueFilesPerScan
+            };
             this.playerProfileRepository = new PlayerProfileRepository(connectionFactory);
 
             if (this.config.EnableDynamicModScanning)
@@ -166,7 +173,7 @@ public sealed class ModEntry : Mod
                 ModScanCoordinator scanCoordinator = new(
                     () => Task.FromResult<string?>(this.GetConfiguredModsFolderPath()),
                     () => Task.FromResult<string?>(this.GetConfiguredGamePath()),
-                    new ModScannerService(),
+                    new ModScannerService(scanOptions),
                     new VanillaCharacterScannerService(),
                     new CharacterValidationService(),
                     characterValidationRepository,
@@ -175,7 +182,7 @@ public sealed class ModEntry : Mod
                     scannedModRepository,
                     loreConflictRepository,
                     scanHistoryRepository,
-                    new DialogueSourceScannerService(canonicalCharacterRepository, dialogueSourceRepository),
+                    new DialogueSourceScannerService(canonicalCharacterRepository, dialogueSourceRepository, null, scanOptions),
                     message => this.Monitor.Log(message, LogLevel.Info));
 
                 _ = Task.Run(async () =>

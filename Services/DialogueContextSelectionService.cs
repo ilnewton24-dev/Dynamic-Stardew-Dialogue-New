@@ -59,20 +59,35 @@ public sealed class DialogueContextSelectionService
 
         string relationshipState = NormalizeRelationshipState(lore.SaveContext.RelationshipState, context.FriendshipLevel);
         string playerName = string.IsNullOrWhiteSpace(lore.SaveContext.PlayerName) ? "you" : lore.SaveContext.PlayerName;
+        bool isSpouseState = relationshipState is "spouse" or "married";
 
         // Pre-filter: only include sources whose cleaned text is usable.
         IReadOnlyList<DialogueSource> usable = lore.DialogueSources
             .Where(s => !string.IsNullOrWhiteSpace(CleanDialogueText(s.RawText, playerName)))
             .ToArray();
 
+        // Hard-exclude Bad_* (negative spouse mood) for any non-spouse scene.
+        // These lines have no voice-calibration value for dating or friend interactions
+        // and should never appear in the prompt regardless of pool size.
+        if (!isSpouseState)
+        {
+            int before = usable.Count;
+            usable = usable.Where(s => !IsBadMoodKey(s.DialogueKey)).ToArray();
+            int removed = before - usable.Count;
+            if (removed > 0)
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Selection] '{context.CharacterName}': hard-excluded {removed} Bad_* source(s) " +
+                    $"[excluded:bad-mood-mismatch] (relationshipState={relationshipState}).");
+        }
+
         System.Diagnostics.Debug.WriteLine(
             $"[Selection] '{context.CharacterName}': {lore.DialogueSources.Count} total sources, " +
-            $"{usable.Count} usable after text-quality filter.");
+            $"{usable.Count} usable after text-quality + hard-exclusion filters.");
 
         if (usable.Count == 0)
             return Array.Empty<ScoredDialogueSource>();
 
-        // Score all usable sources and take the top ones.
+        // Score all remaining sources and take the top ones.
         IReadOnlyList<ScoredDialogueSource> selected = usable
             .Select(source =>
             {
@@ -88,7 +103,7 @@ public sealed class DialogueContextSelectionService
 
         System.Diagnostics.Debug.WriteLine(
             $"[Selection] '{context.CharacterName}': selected {selected.Count} example(s) (limit={limit}), " +
-            $"{selected.Count(s => s.IsVoiceOnlyFallback)} voice-only.");
+            $"{selected.Count(s => s.IsVoiceOnlyFallback)} voice-only [included:voice-only-fallback].");
         return selected;
     }
 
@@ -162,7 +177,7 @@ public sealed class DialogueContextSelectionService
 
     // ── Scoring ──────────────────────────────────────────────────────────────
 
-    internal static (int TotalScore, int SceneScore, string Breakdown, bool IsVoiceOnlyFallback)
+    public static (int TotalScore, int SceneScore, string Breakdown, bool IsVoiceOnlyFallback)
         ScoreSourceWithBreakdown(
             DialogueSource source,
             DialogueContext context,
@@ -174,6 +189,12 @@ public sealed class DialogueContextSelectionService
 
         string key = source.DialogueKey;
         string combined = $"{source.DialogueKey} {source.RawText} {source.Conditions} {source.AssetName}";
+
+        bool isSpouseState = relationshipState is "spouse" or "married";
+        bool isDatingState = relationshipState is "dating";
+        // Friendship level used as spouse-mood proxy: ≥8 = high mood, ≤5 = low/strained.
+        bool isHighMoodSpouse = isSpouseState && context.FriendshipLevel >= 8;
+        bool isLowMoodSpouse  = isSpouseState && context.FriendshipLevel <= 5;
 
         // ── Existing positive bonuses ──────────────────────────────────────
         if (Matches(source.Season, context.Season) || Contains(combined, context.Season))
@@ -203,7 +224,7 @@ public sealed class DialogueContextSelectionService
         int affinity = TopicAffinityScore(context.Topic, key, combined, relationshipState);
         if (affinity > 0) { sceneScore += affinity; parts.Add($"+Affinity:{affinity}"); }
 
-        // ── New: weekday bonus ─────────────────────────────────────────────
+        // ── Weekday bonus ──────────────────────────────────────────────────
         if (lore.SaveContext.Day > 0)
         {
             string weekday = GetWeekdayAbbr(lore.SaveContext.Day);
@@ -211,43 +232,66 @@ public sealed class DialogueContextSelectionService
             { sceneScore += 15; parts.Add("+Weekday:15"); }
         }
 
-        // ── New: neutral general-line bonus ────────────────────────────────
+        // ── Neutral general-line bonus ─────────────────────────────────────
         bool isGeneralTopic = string.IsNullOrWhiteSpace(context.Topic) ||
                               context.Topic.Equals("general", StringComparison.OrdinalIgnoreCase);
         if (isGeneralTopic && IsNeutralKey(key, source.FilePath))
         { sceneScore += 10; parts.Add("+Neutral:10"); }
 
+        // ── Mood-specific spouse bonuses ───────────────────────────────────
+        // Good_* (positive spouse mood) — preferred at high friendship.
+        if (IsGoodMoodKey(key) && isHighMoodSpouse)
+        { sceneScore += 20; parts.Add("+GoodMood:20"); }
+
+        // Neutral_* (neutral spouse mood) — appropriate for ordinary spouse scenes.
+        if (IsNeutralMoodKey(key) && isSpouseState)
+        { sceneScore += 15; parts.Add("+NeutralMood:15"); }
+
         // ── Scene-mismatch penalties ───────────────────────────────────────
         bool isGiftTopic = context.Topic.Contains("gift", StringComparison.OrdinalIgnoreCase) ||
                            context.Topic.Contains("birthday", StringComparison.OrdinalIgnoreCase);
-        bool isSpouseState = relationshipState is "spouse" or "married";
-        bool isDatingState = relationshipState is "dating";
         string? currentFestival = lore.SaveContext.FestivalOrSpecialDay;
 
         bool spouseKeyDetected = IsSpouseSpecificKey(key, source.FilePath);
         bool datingKeyDetected = IsDatingKey(key);
 
         if (IsAcceptGiftKey(key) && !isGiftTopic)
-        { sceneScore -= 60; parts.Add("-AcceptGift:60"); }
+        { sceneScore -= 60; parts.Add("-AcceptGift:60 [excluded:gift-context-mismatch]"); }
 
         if (IsItemGiftKey(key) && !isGiftTopic)
-        { sceneScore -= 50; parts.Add("-ItemGift:50"); }
+        { sceneScore -= 50; parts.Add("-ItemGift:50 [excluded:gift-context-mismatch]"); }
 
         if (IsRejectionKey(key) && !isGiftTopic)
-        { sceneScore -= 60; parts.Add("-Reject:60"); }
+        { sceneScore -= 60; parts.Add("-Reject:60 [excluded:gift-context-mismatch]"); }
 
-        // Bad_* = spouse bad-mood dialogue; only relevant when the player is married to this NPC.
-        if (IsBadMoodKey(key) && !isSpouseState)
-        { sceneScore -= 40; parts.Add("-BadMood:40"); }
+        // Bad_* (negative spouse mood dialogue).
+        // Non-spouse: hard-excluded before this method is reached. Massive safety-net penalty
+        // in case a custom key pattern escapes the pre-filter.
+        // High-heart spouse: penalise in favour of Good_*.
+        // Low/mid-heart spouse: no penalty — contextually valid.
+        if (IsBadMoodKey(key))
+        {
+            if (!isSpouseState)
+            {
+                sceneScore -= 100;
+                parts.Add("-BadMood:100 [excluded:bad-mood-mismatch]");
+            }
+            else if (isHighMoodSpouse)
+            {
+                sceneScore -= 30;
+                parts.Add("-BadMood:30 [high-heart spouse, prefer Good_*]");
+            }
+            // isLowMoodSpouse or mid-heart spouse → no penalty; Bad_* is contextually appropriate.
+        }
 
         // Spouse/marriage keys and structured field — avoid double-penalising the same source.
         if (spouseKeyDetected && !isSpouseState)
-        { sceneScore -= 70; parts.Add("-SpouseMismatch:70"); }
+        { sceneScore -= 70; parts.Add("-SpouseMismatch:70 [excluded:spouse-context-mismatch]"); }
         else if (!spouseKeyDetected &&
                  source.RelationshipState != null &&
                  IsRelationshipMatch(source.RelationshipState, "spouse") &&
                  !isSpouseState)
-        { sceneScore -= 50; parts.Add("-SpouseRelField:50"); }
+        { sceneScore -= 50; parts.Add("-SpouseRelField:50 [excluded:spouse-context-mismatch]"); }
 
         // Dating/flirt keys and structured field.
         if (datingKeyDetected && !isDatingState && !isSpouseState)
@@ -270,8 +314,9 @@ public sealed class DialogueContextSelectionService
         bool isVoiceOnly = sceneScore < 0;
         int totalScore = source.SourcePriority + sceneScore;
 
+        string voiceLabel = isVoiceOnly ? " [included:voice-only-fallback]" : "";
         string breakdown = parts.Count > 0
-            ? $"Priority:{source.SourcePriority} | {string.Join(" | ", parts)} | Scene:{sceneScore} | Total:{totalScore}{(isVoiceOnly ? " [VOICE-ONLY]" : "")}"
+            ? $"Priority:{source.SourcePriority} | {string.Join(" | ", parts)} | Scene:{sceneScore} | Total:{totalScore}{voiceLabel}"
             : $"Priority:{source.SourcePriority} | Scene:0 | Total:{totalScore}";
 
         return (totalScore, sceneScore, breakdown, isVoiceOnly);
@@ -280,33 +325,49 @@ public sealed class DialogueContextSelectionService
     // ── Key-pattern detectors ─────────────────────────────────────────────────
 
     /// <summary>Gift-acceptance keys, with or without quality/item suffix.</summary>
-    internal static bool IsAcceptGiftKey(string key) =>
+    public static bool IsAcceptGiftKey(string key) =>
         key.Contains("AcceptGift", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("AcceptBirthdayGift", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Item-specific gift-override keys not covered by AcceptGift patterns.</summary>
-    internal static bool IsItemGiftKey(string key) =>
+    public static bool IsItemGiftKey(string key) =>
         key.StartsWith("gifted_", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("ItemGifted", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("gift_item", StringComparison.OrdinalIgnoreCase);
 
-    internal static bool IsRejectionKey(string key) =>
+    public static bool IsRejectionKey(string key) =>
         key.StartsWith("Reject", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("_Reject", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>Bad_* = spouse bad-mood dialogue from MarriageDialogue files.</summary>
-    internal static bool IsBadMoodKey(string key) =>
+    /// <summary>Bad_* = negative-mood spouse dialogue (e.g. Bad_0, Bad_1).</summary>
+    public static bool IsBadMoodKey(string key) =>
         key.StartsWith("Bad_", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>Key or file path indicates spouse/marriage-specific content.</summary>
-    internal static bool IsSpouseSpecificKey(string key, string? filePath) =>
+    /// <summary>Good_* = positive-mood spouse dialogue (e.g. Good_0, Good_1).</summary>
+    public static bool IsGoodMoodKey(string key) =>
+        key.StartsWith("Good_", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Neutral_* = neutral-mood spouse dialogue (e.g. Neutral_0, Neutral_1).</summary>
+    public static bool IsNeutralMoodKey(string key) =>
+        key.StartsWith("Neutral_", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Key or file path indicates spouse/marriage-specific content. Covers all SDV and common
+    /// mod conventions: Indoor/Outdoor day keys, child-count variants, spouseRoom, and
+    /// MarriageDialogue/spousePatio file paths.
+    /// </summary>
+    public static bool IsSpouseSpecificKey(string key, string? filePath) =>
         key.StartsWith("Indoor_", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("Outdoor_", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("OneKid_", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("TwoKids_", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("spouseRoom", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("spouse", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("marriage", StringComparison.OrdinalIgnoreCase) ||
         filePath?.Contains("MarriageDialogue", StringComparison.OrdinalIgnoreCase) == true ||
         filePath?.Contains("spousePatioDialogue", StringComparison.OrdinalIgnoreCase) == true;
 
-    internal static bool IsDatingKey(string key) =>
+    public static bool IsDatingKey(string key) =>
         key.Contains("dating", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("flirt", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("romance", StringComparison.OrdinalIgnoreCase);
@@ -318,7 +379,7 @@ public sealed class DialogueContextSelectionService
         "egg_festival", "flower_dance", "spirit_eve", "festival_of_ice", "winter_star"
     };
 
-    internal static bool IsFestivalKey(string key) =>
+    public static bool IsFestivalKey(string key) =>
         FestivalKeyFragments.Any(f => key.Contains(f, StringComparison.OrdinalIgnoreCase)) ||
         key.StartsWith("festival_", StringComparison.OrdinalIgnoreCase);
 
@@ -331,16 +392,20 @@ public sealed class DialogueContextSelectionService
                    currentFestival.Contains(f, StringComparison.OrdinalIgnoreCase));
     }
 
-    /// <summary>A neutral key has no scene-specific category markers.</summary>
-    internal static bool IsNeutralKey(string key, string? filePath) =>
+    /// <summary>
+    /// A neutral key has no scene-specific category markers: no gift, spouse, mood, dating,
+    /// festival, or rejection patterns.
+    /// </summary>
+    public static bool IsNeutralKey(string key, string? filePath) =>
         !IsAcceptGiftKey(key) && !IsItemGiftKey(key) && !IsRejectionKey(key) &&
-        !IsBadMoodKey(key) && !IsSpouseSpecificKey(key, filePath) &&
+        !IsBadMoodKey(key) && !IsGoodMoodKey(key) && !IsNeutralMoodKey(key) &&
+        !IsSpouseSpecificKey(key, filePath) &&
         !IsDatingKey(key) && !IsFestivalKey(key);
 
     // ── Weekday helper ────────────────────────────────────────────────────────
 
     /// <summary>SDV day 1 = Monday. Returns 3-letter abbreviation.</summary>
-    internal static string GetWeekdayAbbr(int dayOfMonth) =>
+    public static string GetWeekdayAbbr(int dayOfMonth) =>
         ((dayOfMonth - 1) % 7) switch
         {
             0 => "Mon",

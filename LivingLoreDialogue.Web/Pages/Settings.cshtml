@@ -8,6 +8,10 @@
         <label>Model name <select name="openAiModel" id="settings-model-select" required></select></label>
         <label>Stardew Valley game path <input name="gamePath"></label>
         <label>Mods folder path <input name="modsFolderPath"></label>
+        <label>Scan timeout seconds <input name="scanTimeoutSeconds" type="number" min="1"></label>
+        <label>Per-file parse timeout ms <input name="perFileParseTimeoutMs" type="number" min="50"></label>
+        <label class="checkbox"><input name="enableScanCache" type="checkbox"> Scan cache enabled</label>
+        <label>Max dialogue files per scan <input name="maxDialogueFilesPerScan" type="number" min="1"></label>
         <label class="checkbox"><input name="enableLiveInGameDialogueGeneration" type="checkbox"> Live in-game generation enabled</label>
         <button type="submit">Save Settings</button>
     </form>

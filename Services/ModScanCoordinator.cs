@@ -68,23 +68,26 @@ public sealed class ModScanCoordinator
 
             string? configuredGamePath = await this.loadGamePath();
             string gamePath = ResolveGamePath(configuredGamePath, modsFolderPath) ?? "";
+            TimeSpan elapsed() => DateTime.UtcNow - startedAt;
 
             Stopwatch phaseTimer = Stopwatch.StartNew();
-            this.Report(progress, "Vanilla scan", "Vanilla scan started.", TimeSpan.Zero);
+            this.Report(progress, "vanilla character scan", "Vanilla scan started.", TimeSpan.Zero, elapsed());
             ModScanResult vanillaScanResult = await this.vanillaScanner.ScanAsync(gamePath);
-            this.Report(progress, "Vanilla scan", "Vanilla scan completed.", phaseTimer.Elapsed, vanillaScanResult.FilesInspected, vanillaScanResult.Candidates.Count, 0, vanillaScanResult.Errors.Count, vanillaScanResult.Errors.Count);
+            this.Report(progress, "vanilla character scan", "Vanilla scan completed.", phaseTimer.Elapsed, elapsed(), vanillaScanResult.FilesInspected, vanillaScanResult.Candidates.Count, 0, vanillaScanResult.Errors.Count, vanillaScanResult.Errors.Count);
 
             phaseTimer.Restart();
-            this.Report(progress, "Mods scan", "Mods scan started.", TimeSpan.Zero);
+            this.Report(progress, "mod manifest discovery", "Mod manifest discovery and character scan started.", TimeSpan.Zero, elapsed());
             ModScanResult modScanResult = await this.scanner.ScanAsync(modsFolderPath);
-            this.Report(progress, "Mods scan", "Mods scan completed.", phaseTimer.Elapsed, modScanResult.FilesInspected, modScanResult.Candidates.Count, 0, modScanResult.Errors.Count, modScanResult.Errors.Count);
+            this.Report(progress, "mod manifest discovery", "Mod manifest discovery completed.", phaseTimer.Elapsed, elapsed(), modScanResult.FilesInspected, modScanResult.Mods.Count, 0, modScanResult.Errors.Count, modScanResult.Errors.Count, modScanResult.TotalFilesQueued, modScanResult.FilesScanned, modScanResult.FilesSkippedFromCache, modScanResult.FilesFailed, modScanResult.FilesRemaining, modScanResult.LastFileProcessed, modScanResult.TimedOut, modScanResult.DatabaseStatePartial);
+            this.Report(progress, "mod character scan", "Mod character scan completed.", phaseTimer.Elapsed, elapsed(), modScanResult.FilesInspected, modScanResult.Candidates.Count, 0, modScanResult.Errors.Count, modScanResult.Errors.Count, modScanResult.TotalFilesQueued, modScanResult.FilesScanned, modScanResult.FilesSkippedFromCache, modScanResult.FilesFailed, modScanResult.FilesRemaining, modScanResult.LastFileProcessed, modScanResult.TimedOut, modScanResult.DatabaseStatePartial);
 
             ModScanResult scanResult = CombineScanResults(modScanResult, vanillaScanResult);
             errors.AddRange(scanResult.Errors);
-            fatalErrors.AddRange(modScanResult.Errors);
+            if (modScanResult.TimedOut)
+                fatalErrors.AddRange(modScanResult.Errors);
 
             phaseTimer.Restart();
-            this.Report(progress, "Database upsert", "Database upsert started.", TimeSpan.Zero, scanResult.FilesInspected, scanResult.Candidates.Count, 0, errors.Count, fatalErrors.Count);
+            this.Report(progress, "database upsert", "Database upsert started.", TimeSpan.Zero, elapsed(), scanResult.FilesInspected, scanResult.Candidates.Count, 0, errors.Count, fatalErrors.Count);
             foreach (ScannedMod mod in scanResult.Mods)
                 await this.scannedModRepository.UpsertAsync(mod);
             int modsDeactivated = await this.scannedModRepository.MarkMissingInactiveAsync(scanResult.Mods.Select(mod => mod.UniqueId), DateTime.UtcNow);
@@ -102,15 +105,15 @@ public sealed class ModScanCoordinator
             IReadOnlyList<CharacterValidationResult> validationResults = this.validationService.Validate(scanResult.Candidates);
             foreach (CharacterValidationResult validationResult in validationResults)
                 await this.validationRepository.UpsertAsync(validationResult);
-            this.Report(progress, "Database upsert", "Database upsert completed.", phaseTimer.Elapsed, scanResult.FilesInspected, scanResult.Candidates.Count, 0, errors.Count, fatalErrors.Count);
+            this.Report(progress, "database upsert", "Database upsert completed.", phaseTimer.Elapsed, elapsed(), scanResult.FilesInspected, scanResult.Candidates.Count, 0, errors.Count, fatalErrors.Count);
 
             phaseTimer.Restart();
-            this.Report(progress, "Merge", "Merge started.", TimeSpan.Zero, scanResult.FilesInspected, scanResult.Candidates.Count, 0, errors.Count, fatalErrors.Count);
+            this.Report(progress, "merge/reconcile", "Merge/reconcile started.", TimeSpan.Zero, elapsed(), scanResult.FilesInspected, scanResult.Candidates.Count, 0, errors.Count, fatalErrors.Count);
             List<ScannedCharacter> importable = await this.BuildImportableCharactersAsync(scanResult.Candidates, validationResults);
-            this.Report(progress, "Merge", "Merge completed.", phaseTimer.Elapsed, 0, importable.Count, 0, errors.Count, fatalErrors.Count);
+            this.Report(progress, "merge/reconcile", "Merge/reconcile completed.", phaseTimer.Elapsed, elapsed(), 0, importable.Count, 0, errors.Count, fatalErrors.Count);
 
             phaseTimer.Restart();
-            this.Report(progress, "Database upsert", "Database character upsert started.", TimeSpan.Zero, 0, importable.Count, 0, errors.Count, fatalErrors.Count);
+            this.Report(progress, "database upsert", "Database character upsert started.", TimeSpan.Zero, elapsed(), 0, importable.Count, 0, errors.Count, fatalErrors.Count);
             CharacterSyncSummary syncSummary = await this.syncService.SyncAsync(importable);
             await this.canonicalRepository.RefreshActivityFromCharactersAsync();
             this.log?.Invoke(
@@ -119,25 +122,36 @@ public sealed class ModScanCoordinator
                 $"({syncSummary.ActiveCharactersInDatabase} active, {syncSummary.TotalCharactersInDatabase - syncSummary.ActiveCharactersInDatabase} historical/inactive); " +
                 $"added {syncSummary.CharactersAdded}, updated {syncSummary.CharactersUpdated}, reactivated {syncSummary.CharactersReactivated}, " +
                 $"marked inactive {syncSummary.CharactersMarkedInactive} this scan.");
-            this.Report(progress, "Database upsert", "Database character upsert completed.", phaseTimer.Elapsed, 0, importable.Count, 0, errors.Count, fatalErrors.Count);
+            this.Report(progress, "database upsert", "Database character upsert completed.", phaseTimer.Elapsed, elapsed(), 0, importable.Count, 0, errors.Count, fatalErrors.Count);
 
+            DialogueSourceScanSummary? dialogueScanSummary = null;
             if (this.dialogueSourceScanner is not null)
             {
                 phaseTimer.Restart();
-                this.Report(progress, "Dialogue source scan", "Dialogue source scan started.", TimeSpan.Zero);
+                this.Report(progress, "dialogue source scan", "Dialogue source scan started.", TimeSpan.Zero, elapsed());
                 DialogueSourceScanSummary dialogueScan = await this.dialogueSourceScanner.ScanAsync(modsFolderPath);
+                dialogueScanSummary = dialogueScan;
                 errors.AddRange(dialogueScan.Errors.Take(20).Select(error => $"Dialogue source error: {error}"));
-                this.Report(progress, "Dialogue source scan", "Dialogue source scan completed.", phaseTimer.Elapsed, dialogueScan.FilesInspected, 0, dialogueScan.FilesRead, dialogueScan.Warnings.Count, dialogueScan.Errors.Count);
+                if (dialogueScan.TimedOut)
+                    fatalErrors.AddRange(dialogueScan.Errors);
+                this.Report(progress, "dialogue source scan", dialogueScan.TimedOut ? "Dialogue source scan saved partial progress after timeout." : "Dialogue source scan completed.", phaseTimer.Elapsed, elapsed(), dialogueScan.FilesInspected, 0, dialogueScan.FilesRead, dialogueScan.Warnings.Count, dialogueScan.Errors.Count, dialogueScan.TotalFilesQueued, dialogueScan.FilesScanned, dialogueScan.FilesSkippedFromCache, dialogueScan.FilesFailed, dialogueScan.FilesRemaining, dialogueScan.LastFileProcessed, dialogueScan.TimedOut, dialogueScan.DatabaseStatePartial);
                 this.log?.Invoke(
                     $"Dialogue source scan: {dialogueScan.SourcesFound} lines found from {dialogueScan.FilesRead} files in '{modsFolderPath}'; " +
+                    $"queued={dialogueScan.TotalFilesQueued}, scanned={dialogueScan.FilesScanned}, cacheSkipped={dialogueScan.FilesSkippedFromCache}, failed={dialogueScan.FilesFailed}; " +
                     $"{dialogueScan.SourcesDeactivated} stale source(s) from inactive/removed mods deactivated; " +
                     $"warnings={dialogueScan.Warnings.Count}, recovered={dialogueScan.Diagnostics.Count}, errors={dialogueScan.Errors.Count}.");
                 if (dialogueScan.Warnings.Count > 0)
                     this.log?.Invoke($"Dialogue source scan diagnostics: {dialogueScan.Warnings.Count} zero-line dialogue file(s) classified. See dashboard scan details for paths.");
             }
+            bool isPartial = modScanResult.TimedOut || dialogueScanSummary?.TimedOut == true;
             ModScanSummary summary = new()
             {
-                Success = fatalErrors.Count == 0,
+                Success = fatalErrors.Count == 0 || isPartial,
+                IsPartial = isPartial,
+                TimedOutPhase = modScanResult.TimedOut ? modScanResult.TimedOutPhase : dialogueScanSummary?.TimedOutPhase ?? "",
+                LastFileProcessed = modScanResult.TimedOut ? modScanResult.LastFileProcessed : dialogueScanSummary?.LastFileProcessed ?? "",
+                FilesRemaining = modScanResult.TimedOut ? modScanResult.FilesRemaining : dialogueScanSummary?.FilesRemaining ?? 0,
+                DatabaseStatePartial = modScanResult.DatabaseStatePartial || dialogueScanSummary?.DatabaseStatePartial == true,
                 StartedAt = startedAt,
                 CompletedAt = DateTime.UtcNow,
                 ModsScanned = scanResult.Mods.Count,
@@ -150,6 +164,10 @@ public sealed class ModScanCoordinator
                 CharactersReactivated = syncSummary.CharactersReactivated,
                 CharactersMarkedInactive = syncSummary.CharactersMarkedInactive,
                 ConflictsFound = await this.conflictRepository.CountUnreviewedAsync(),
+                TotalFilesQueued = scanResult.TotalFilesQueued + (dialogueScanSummary?.TotalFilesQueued ?? 0),
+                FilesScanned = scanResult.FilesScanned + (dialogueScanSummary?.FilesScanned ?? 0),
+                FilesSkippedFromCache = scanResult.FilesSkippedFromCache + (dialogueScanSummary?.FilesSkippedFromCache ?? 0),
+                FilesFailed = scanResult.FilesFailed + (dialogueScanSummary?.FilesFailed ?? 0),
                 Warnings = Array.Empty<string>(),
                 Errors = errors
             };
@@ -253,6 +271,15 @@ public sealed class ModScanCoordinator
             VanillaCharactersFound = vanillaScanResult.Candidates.Count,
             ModdedCharactersFound = modScanResult.Candidates.Count,
             FilesInspected = vanillaScanResult.FilesInspected + modScanResult.FilesInspected,
+            TotalFilesQueued = vanillaScanResult.TotalFilesQueued + modScanResult.TotalFilesQueued,
+            FilesScanned = vanillaScanResult.FilesScanned + modScanResult.FilesScanned,
+            FilesSkippedFromCache = vanillaScanResult.FilesSkippedFromCache + modScanResult.FilesSkippedFromCache,
+            FilesFailed = vanillaScanResult.FilesFailed + modScanResult.FilesFailed,
+            TimedOut = vanillaScanResult.TimedOut || modScanResult.TimedOut,
+            TimedOutPhase = modScanResult.TimedOut ? modScanResult.TimedOutPhase : vanillaScanResult.TimedOutPhase,
+            LastFileProcessed = modScanResult.TimedOut ? modScanResult.LastFileProcessed : vanillaScanResult.LastFileProcessed,
+            FilesRemaining = modScanResult.FilesRemaining + vanillaScanResult.FilesRemaining,
+            DatabaseStatePartial = modScanResult.DatabaseStatePartial || vanillaScanResult.DatabaseStatePartial,
             Errors = vanillaScanResult.Errors.Concat(modScanResult.Errors).ToArray()
         };
     }
@@ -262,25 +289,43 @@ public sealed class ModScanCoordinator
         string phase,
         string message,
         TimeSpan duration,
+        TimeSpan elapsed,
         int filesInspected = 0,
         int charactersFound = 0,
         int dialogueFilesFound = 0,
         int warnings = 0,
-        int errors = 0)
+        int errors = 0,
+        int totalFilesQueued = 0,
+        int filesScanned = 0,
+        int filesSkippedFromCache = 0,
+        int filesFailed = 0,
+        int filesRemaining = 0,
+        string lastFileProcessed = "",
+        bool timedOut = false,
+        bool databaseStatePartial = false)
     {
         ScanPhaseProgress update = new()
         {
             Phase = phase,
             Message = message,
             Duration = duration,
+            Elapsed = elapsed,
+            TotalFilesQueued = totalFilesQueued,
             FilesInspected = filesInspected,
+            FilesScanned = filesScanned,
+            FilesSkippedFromCache = filesSkippedFromCache,
+            FilesFailed = filesFailed,
+            FilesRemaining = filesRemaining,
+            LastFileProcessed = lastFileProcessed,
+            TimedOut = timedOut,
+            DatabaseStatePartial = databaseStatePartial,
             CharactersFound = charactersFound,
             DialogueFilesFound = dialogueFilesFound,
             Warnings = warnings,
             Errors = errors
         };
         progress?.Invoke(update);
-        this.log?.Invoke($"{message} duration={duration.TotalMilliseconds:0}ms files={filesInspected} characters={charactersFound} dialogueFiles={dialogueFilesFound} warnings={warnings} errors={errors}.");
+        this.log?.Invoke($"{message} duration={duration.TotalMilliseconds:0}ms elapsed={elapsed.TotalMilliseconds:0}ms files={filesInspected} queued={totalFilesQueued} scanned={filesScanned} cacheSkipped={filesSkippedFromCache} failed={filesFailed} remaining={filesRemaining} characters={charactersFound} dialogueFiles={dialogueFilesFound} warnings={warnings} errors={errors} partial={databaseStatePartial}.");
     }
 
     private static string? ResolveGamePath(string? configuredGamePath, string modsFolderPath)

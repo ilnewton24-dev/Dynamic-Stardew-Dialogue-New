@@ -311,6 +311,18 @@ CREATE TABLE IF NOT EXISTS CharacterValidationResults (
     UpdatedDate TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ScanFileCache (
+    CacheKind TEXT NOT NULL,
+    FilePath TEXT NOT NULL,
+    SourceModId TEXT NULL,
+    LastWriteUtcTicks INTEGER NOT NULL,
+    FileSize INTEGER NOT NULL,
+    ContentHash TEXT NOT NULL,
+    PayloadJson TEXT NOT NULL,
+    UpdatedAt TEXT NOT NULL,
+    PRIMARY KEY (CacheKind, FilePath)
+);
+
 -- Explainability: a complete trace of the inputs used to generate each dialogue line.
 -- Intentionally has no cascading foreign key so explanation history is never auto-deleted.
 CREATE TABLE IF NOT EXISTS DialogueGenerationTrace (
@@ -453,3 +465,4 @@ CREATE INDEX IF NOT EXISTS IX_LoreConflicts_Reviewed ON LoreConflicts(IsReviewed
 CREATE INDEX IF NOT EXISTS IX_ScanHistory_StartedAt ON ScanHistory(StartedAt);
 CREATE UNIQUE INDEX IF NOT EXISTS UX_CharacterValidation_Mod_Name ON CharacterValidationResults(SourceModId, Name);
 CREATE INDEX IF NOT EXISTS IX_CharacterValidation_Classification ON CharacterValidationResults(Classification, Score);
+CREATE INDEX IF NOT EXISTS IX_ScanFileCache_Kind_Mod ON ScanFileCache(CacheKind, SourceModId);

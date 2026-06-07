@@ -8,7 +8,7 @@ namespace LivingLoreDialogue.Services;
 public sealed class ModScannerService
 {
     private const int MaxFilesInspected = 20000;
-    private static readonly TimeSpan MaxScanDuration = TimeSpan.FromSeconds(30);
+    private readonly ScanOptions options;
 
     private static readonly JsonDocumentOptions JsonDocumentOptions = new()
     {
@@ -23,13 +23,18 @@ public sealed class ModScannerService
         ReadCommentHandling = JsonCommentHandling.Skip
     };
 
+    public ModScannerService(ScanOptions? options = null)
+    {
+        this.options = options ?? new ScanOptions();
+    }
+
     public Task<ModScanResult> ScanAsync(string modsFolderPath)
     {
         DateTime startedAt = DateTime.UtcNow;
         List<ScannedMod> mods = new();
         Dictionary<string, CharacterCandidate> candidates = new(StringComparer.OrdinalIgnoreCase);
         List<string> errors = new();
-        ScanBudget budget = new(startedAt);
+        ScanBudget budget = new(startedAt, this.options.ScanTimeout);
 
         string fullModsFolderPath = Path.GetFullPath(modsFolderPath);
         foreach (string manifestPath in EnumerateFilesGuarded(fullModsFolderPath, "manifest.json", budget, errors))
@@ -91,6 +96,13 @@ public sealed class ModScannerService
             Mods = mods.OrderBy(mod => mod.Name).ToArray(),
             Candidates = candidates.Values.OrderBy(candidate => candidate.Name).ToArray(),
             FilesInspected = budget.FilesInspected,
+            TotalFilesQueued = budget.FilesInspected,
+            FilesScanned = budget.FilesScanned,
+            FilesFailed = budget.FilesFailed,
+            TimedOut = budget.TimedOut,
+            TimedOutPhase = budget.TimedOut ? "mod character scan" : "",
+            LastFileProcessed = budget.LastFileProcessed,
+            FilesRemaining = budget.FilesRemaining,
             Errors = errors
         };
 
@@ -123,11 +135,18 @@ public sealed class ModScannerService
                 rawJson = File.ReadAllText(filePath);
                 document = JsonDocument.Parse(rawJson, JsonDocumentOptions);
             }
-            catch
+            catch (Exception ex)
             {
                 // Many Stardew content packs contain tokenized or dialogue-like JSON fragments
                 // which are not valid standalone JSON. They are not fatal to the scan.
+                budget.FilesFailed++;
+                errors.Add($"Skipped malformed NPC-related JSON file '{filePath}': {ex.Message}");
                 continue;
+            }
+            finally
+            {
+                budget.FilesScanned++;
+                budget.LastFileProcessed = filePath;
             }
 
             using (document)
@@ -490,9 +509,11 @@ public sealed class ModScannerService
                 yield break;
             }
 
-            if (DateTime.UtcNow - budget.StartedAt > MaxScanDuration)
+            if (DateTime.UtcNow - budget.StartedAt > budget.Timeout)
             {
-                errors.Add($"Mod scan stopped after {MaxScanDuration.TotalSeconds:0}s safety limit.");
+                budget.TimedOut = true;
+                budget.FilesRemaining = pending.Count;
+                errors.Add($"Mod character scan stopped after {budget.Timeout.TotalSeconds:0}s safety limit. Last file processed: '{budget.LastFileProcessed}'. Remaining folders queued: {budget.FilesRemaining}.");
                 yield break;
             }
 
@@ -562,11 +583,23 @@ public sealed class ModScannerService
     private sealed class ScanBudget
     {
         public ScanBudget(DateTime startedAt)
+            : this(startedAt, TimeSpan.FromSeconds(90))
+        {
+        }
+
+        public ScanBudget(DateTime startedAt, TimeSpan timeout)
         {
             this.StartedAt = startedAt;
+            this.Timeout = timeout;
         }
 
         public DateTime StartedAt { get; }
+        public TimeSpan Timeout { get; }
         public int FilesInspected { get; set; }
+        public int FilesScanned { get; set; }
+        public int FilesFailed { get; set; }
+        public bool TimedOut { get; set; }
+        public string LastFileProcessed { get; set; } = "";
+        public int FilesRemaining { get; set; }
     }
 }

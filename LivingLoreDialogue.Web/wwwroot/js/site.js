@@ -653,8 +653,10 @@ function bindModScan() {
             const summary = finalStatus.summary;
             if (!summary) throw new Error(finalStatus.message || "Scan finished without a summary.");
 
-            result.className = summary.success ? "status success" : "status error";
-            result.textContent = summary.success
+            result.className = summary.isPartial ? "status warning" : summary.success ? "status success" : "status error";
+            result.textContent = summary.isPartial
+                ? formatPartialScan(summary)
+                : summary.success
                 ? formatScanSuccess(summary)
                 : formatScanErrors(summary.errors);
 
@@ -685,10 +687,10 @@ async function pollModScanStatus(scanRunId, result) {
         const status = statusResponse.body;
         const elapsed = Math.round((Date.now() - started) / 1000);
         const phase = status.phase ? `${status.phase}: ` : "";
-        const metrics = ` Files ${status.filesInspected ?? status.lastPhase?.filesInspected ?? 0}, characters ${status.charactersFound ?? status.lastPhase?.charactersFound ?? 0}, dialogue files ${status.dialogueFilesFound ?? status.lastPhase?.dialogueFilesFound ?? 0}.`;
+        const metrics = ` Files ${status.filesInspected ?? status.lastPhase?.filesInspected ?? 0}, queued ${status.totalFilesQueued ?? 0}, scanned ${status.filesScanned ?? 0}, cache ${status.filesSkippedFromCache ?? 0}, failed ${status.filesFailed ?? 0}, remaining ${status.filesRemaining ?? 0}, characters ${status.charactersFound ?? status.lastPhase?.charactersFound ?? 0}, dialogue files ${status.dialogueFilesFound ?? status.lastPhase?.dialogueFilesFound ?? 0}.`;
         result.textContent = `${phase}${status.message || "Scanning..."} ${elapsed}s elapsed.${metrics}`;
 
-        if (status.state === "Completed" || status.state === "Failed")
+        if (status.state === "Completed" || status.state === "Failed" || status.state === "Partial")
             return status;
     }
 
@@ -712,6 +714,13 @@ function formatScanSuccess(summary) {
     const warningCount = summary.errors ? summary.errors.length : 0;
     const warningText = warningCount > 0 ? ` ${warningCount} warning(s) were recorded in scan history.` : "";
     return `Scan complete. ${summary.modsScanned} mods scanned, ${summary.vanillaCharactersFound ?? 0} vanilla characters, ${summary.moddedCharactersFound ?? 0} modded characters, ${summary.mergedCanonicalCharacters ?? 0} canonical profiles.${warningText}`;
+}
+
+function formatPartialScan(summary) {
+    const phase = summary.timedOutPhase || "scan";
+    const lastFile = summary.lastFileProcessed ? ` Last file: ${summary.lastFileProcessed}.` : "";
+    const partialDb = summary.databaseStatePartial ? " Database state is partial." : "";
+    return `Partial scan saved after timeout in ${phase}. ${summary.filesRemaining ?? 0} file(s) remaining.${lastFile}${partialDb}`;
 }
 
 function formatScanErrors(errors) {
@@ -1431,13 +1440,19 @@ async function loadSettings() {
 
     form.gamePath.value = settings.gamePath ?? "";
     form.modsFolderPath.value = settings.modsFolderPath ?? "";
+    form.scanTimeoutSeconds.value = settings.scanTimeoutSeconds ?? 90;
+    form.perFileParseTimeoutMs.value = settings.perFileParseTimeoutMs ?? 1000;
+    form.enableScanCache.checked = settings.enableScanCache ?? true;
+    form.maxDialogueFilesPerScan.value = settings.maxDialogueFilesPerScan ?? "";
     form.enableLiveInGameDialogueGeneration.checked = settings.enableLiveInGameDialogueGeneration;
 }
 
 function bindSettingsForm() {
     document.getElementById("settings-form").addEventListener("submit", async event => {
         event.preventDefault();
-        await api("/api/settings", { method: "POST", body: JSON.stringify(formJson(event.target)) });
+        const body = formJson(event.target);
+        body.maxDialogueFilesPerScan = body.maxDialogueFilesPerScan > 0 ? body.maxDialogueFilesPerScan : null;
+        await api("/api/settings", { method: "POST", body: JSON.stringify(body) });
         await loadSettings();
     });
 }
@@ -1454,6 +1469,7 @@ function link(href, text) {
 
 async function loadPlayerProfilesPage() {
     bindPlayerProfileForm();
+    bindPlayerProfileAutocomplete();
     await refreshPlayerProfilesList();
 }
 
@@ -1498,15 +1514,19 @@ function loadProfileIntoForm(profile) {
     for (const key of ["id", "profileName", "farmerName", "farmName", "saveFileName", "saveFilePath",
         "description", "backstory", "personality", "roleplayStyle", "preferredTone",
         "importantHistory", "currentGoals", "relationshipNotes", "customLore"]) {
-        if (form[key]) form[key].value = profile[key] ?? "";
+        const control = profileFormControl(form, key);
+        if (control) control.value = profile[key] ?? "";
     }
+    resetProfileAutocompleteDraft();
 }
 
 function bindPlayerProfileForm() {
     document.getElementById("profile-new").addEventListener("click", () => {
-        document.getElementById("profile-form").reset();
-        document.getElementById("profile-form").id.value = "";
+        const form = document.getElementById("profile-form");
+        form.reset();
+        profileFormControl(form, "id").value = "";
         document.getElementById("profile-form-title").textContent = "Create Player Profile";
+        resetProfileAutocompleteDraft();
     });
 
     document.getElementById("profile-form").addEventListener("submit", async event => {
@@ -1526,6 +1546,172 @@ function bindPlayerProfileForm() {
             status.textContent = error.message;
         }
     });
+}
+
+function profileFormControl(form, name) {
+    return form.elements.namedItem(name);
+}
+
+const playerProfileGeneratedFields = [
+    ["profileName", "profileName"],
+    ["description", "description"],
+    ["backstory", "backstory"],
+    ["personality", "personality"],
+    ["roleplayStyle", "roleplayStyle"],
+    ["preferredTone", "preferredDialogueTone"],
+    ["importantHistory", "importantHistory"],
+    ["currentGoals", "currentGoals"],
+    ["relationshipNotes", "relationshipNotes"],
+    ["customLore", "customLore"]
+];
+
+function bindPlayerProfileAutocomplete() {
+    const generate = document.getElementById("profile-generate");
+    const regenerate = document.getElementById("profile-regenerate");
+    const clear = document.getElementById("profile-clear-generated");
+    if (!generate || generate._bound) return;
+    generate._bound = true;
+    generate.addEventListener("click", () => generatePlayerProfileDraft());
+    regenerate?.addEventListener("click", () => generatePlayerProfileDraft());
+    clear?.addEventListener("click", () => clearGeneratedProfileFields());
+}
+
+function currentPlayerProfileDraft() {
+    const form = document.getElementById("profile-form");
+    return {
+        profileName: profileFormControl(form, "profileName")?.value ?? "",
+        description: profileFormControl(form, "description")?.value ?? "",
+        backstory: profileFormControl(form, "backstory")?.value ?? "",
+        personality: profileFormControl(form, "personality")?.value ?? "",
+        roleplayStyle: profileFormControl(form, "roleplayStyle")?.value ?? "",
+        preferredTone: profileFormControl(form, "preferredTone")?.value ?? "",
+        importantHistory: profileFormControl(form, "importantHistory")?.value ?? "",
+        currentGoals: profileFormControl(form, "currentGoals")?.value ?? "",
+        relationshipNotes: profileFormControl(form, "relationshipNotes")?.value ?? "",
+        customLore: profileFormControl(form, "customLore")?.value ?? ""
+    };
+}
+
+async function generatePlayerProfileDraft() {
+    const form = document.getElementById("profile-form");
+    const concept = document.getElementById("profile-concept").value.trim();
+    const status = document.getElementById("profile-ai-status");
+    const generate = document.getElementById("profile-generate");
+    const regenerate = document.getElementById("profile-regenerate");
+    const overwriteExisting = document.querySelector("input[name='profileGenerationMode']:checked")?.value === "overwrite";
+
+    if (!concept) {
+        status.className = "status error";
+        status.textContent = "Enter a profile concept first.";
+        return;
+    }
+    if (concept.length > 500) {
+        status.className = "status error";
+        status.textContent = "Profile concept must be 500 characters or fewer.";
+        return;
+    }
+
+    const before = currentPlayerProfileDraft();
+    status.className = "status";
+    status.textContent = "Drafting profile...";
+    generate.disabled = true;
+    if (regenerate) regenerate.disabled = true;
+
+    try {
+        const { body } = await apiWithResponse("/api/player-profiles/autocomplete", {
+            method: "POST",
+            body: JSON.stringify({
+                concept,
+                existingProfile: before,
+                overwriteExisting
+            })
+        });
+
+        const changed = applyGeneratedProfile(body.profile, before);
+        form._generatedProfileSnapshot = changed;
+        showGeneratedProfilePreview(body.profile, changed, body.warnings || []);
+        status.className = "status success";
+        status.textContent = changed.length
+            ? "Draft applied. Review and edit before saving."
+            : "Draft returned, but no blank fields needed filling.";
+        document.getElementById("profile-regenerate").hidden = false;
+        document.getElementById("profile-clear-generated").hidden = changed.length === 0;
+    } catch (error) {
+        status.className = "status error";
+        status.textContent = error.message;
+    } finally {
+        generate.disabled = false;
+        if (regenerate) regenerate.disabled = false;
+    }
+}
+
+function applyGeneratedProfile(profile, before) {
+    const form = document.getElementById("profile-form");
+    const changed = [];
+    for (const [formKey, profileKey] of playerProfileGeneratedFields) {
+        const control = profileFormControl(form, formKey);
+        if (!control) continue;
+        const next = profile?.[profileKey] ?? "";
+        if (control.value !== next) {
+            changed.push({ formKey, previous: before[formKey] ?? "", next });
+            control.value = next;
+        }
+    }
+    return changed;
+}
+
+function showGeneratedProfilePreview(profile, changed, warnings) {
+    const preview = document.getElementById("profile-ai-preview");
+    const changedLabels = new Map([
+        ["profileName", "Profile Name"],
+        ["description", "Description"],
+        ["backstory", "Backstory"],
+        ["personality", "Personality"],
+        ["roleplayStyle", "Roleplay Style"],
+        ["preferredTone", "Preferred Dialogue Tone"],
+        ["importantHistory", "Important History"],
+        ["currentGoals", "Current Goals"],
+        ["relationshipNotes", "Relationship Notes"],
+        ["customLore", "Custom Lore"]
+    ]);
+    const labels = changed.map(item => changedLabels.get(item.formKey)).filter(Boolean);
+    preview.hidden = false;
+    preview.innerHTML = `
+        <strong>Generated draft ready for review.</strong>
+        <p>${labels.length ? `Updated ${escapeHtml(labels.join(", "))}.` : "No fields were changed because existing values were preserved."}</p>
+        ${profile?.description ? `<p>${escapeHtml(profile.description)}</p>` : ""}
+        ${warnings.length ? `<p class="status warning">${warnings.map(escapeHtml).join(" ")}</p>` : ""}`;
+}
+
+function clearGeneratedProfileFields() {
+    const form = document.getElementById("profile-form");
+    for (const item of form._generatedProfileSnapshot || []) {
+        const control = profileFormControl(form, item.formKey);
+        if (control) control.value = item.previous;
+    }
+    resetProfileAutocompleteDraft();
+    const status = document.getElementById("profile-ai-status");
+    status.className = "status";
+    status.textContent = "Generated changes cleared.";
+}
+
+function resetProfileAutocompleteDraft() {
+    const form = document.getElementById("profile-form");
+    if (form) form._generatedProfileSnapshot = [];
+    const preview = document.getElementById("profile-ai-preview");
+    if (preview) {
+        preview.hidden = true;
+        preview.innerHTML = "";
+    }
+    const status = document.getElementById("profile-ai-status");
+    if (status) {
+        status.className = "status";
+        status.textContent = "";
+    }
+    const regenerate = document.getElementById("profile-regenerate");
+    const clear = document.getElementById("profile-clear-generated");
+    if (regenerate) regenerate.hidden = true;
+    if (clear) clear.hidden = true;
 }
 
 async function loadPlayerProfileDetailPage() {

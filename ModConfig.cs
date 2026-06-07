@@ -8,6 +8,10 @@ public sealed class ModConfig
     public int MaxRecentMemories { get; set; } = 8;
     public bool EnableSeedDataOnFirstRun { get; set; } = true;
     public bool EnableDynamicModScanning { get; set; } = true;
+    public int ScanTimeoutSeconds { get; set; } = 90;
+    public int PerFileParseTimeoutMs { get; set; } = 1000;
+    public bool EnableScanCache { get; set; } = true;
+    public int? MaxDialogueFilesPerScan { get; set; }
     public string GamePath { get; set; } = "";
     public string ModsFolderPath { get; set; } = "";
     public bool EnableLiveInGameDialogueGeneration { get; set; } = true;

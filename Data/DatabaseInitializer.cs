@@ -39,6 +39,15 @@ public sealed class DatabaseInitializer
         {
             ["SourceRootPath"] = "TEXT NULL"
         });
+        await AddMissingColumnsAsync(connection, "ScanFileCache", new()
+        {
+            ["SourceModId"] = "TEXT NULL",
+            ["LastWriteUtcTicks"] = "INTEGER NOT NULL DEFAULT 0",
+            ["FileSize"] = "INTEGER NOT NULL DEFAULT 0",
+            ["ContentHash"] = "TEXT NOT NULL DEFAULT ''",
+            ["PayloadJson"] = "TEXT NOT NULL DEFAULT '{}'",
+            ["UpdatedAt"] = "TEXT NOT NULL DEFAULT ''"
+        });
         await AddMissingColumnsAsync(connection, "DialogueGenerationTrace", new()
         {
             ["InterceptedNpcName"] = "TEXT NOT NULL DEFAULT ''",

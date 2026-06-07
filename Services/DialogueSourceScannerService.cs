@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using LivingLoreDialogue.Models;
@@ -8,7 +9,7 @@ namespace LivingLoreDialogue.Services;
 public sealed class DialogueSourceScannerService
 {
     private const int MaxFilesInspected = 20000;
-    private static readonly TimeSpan MaxScanDuration = TimeSpan.FromSeconds(30);
+    private const string DialogueCacheKind = "dialogue-source";
     private static readonly Regex FallbackDialoguePairRegex = new(
         "\"(?<key>(?:\\\\.|[^\"\\\\])+)\"\\s*:\\s*\"(?<value>(?:\\\\.|[^\"\\\\])*)\"",
         RegexOptions.Compiled | RegexOptions.Singleline);
@@ -21,26 +22,34 @@ public sealed class DialogueSourceScannerService
 
     private readonly CanonicalCharacterRepository canonicalRepository;
     private readonly DialogueSourceRepository dialogueSourceRepository;
+    private readonly ScanFileCacheRepository? scanFileCacheRepository;
+    private readonly ScanOptions options;
 
     public DialogueSourceScannerService(
         CanonicalCharacterRepository canonicalRepository,
-        DialogueSourceRepository dialogueSourceRepository)
+        DialogueSourceRepository dialogueSourceRepository,
+        ScanFileCacheRepository? scanFileCacheRepository = null,
+        ScanOptions? options = null)
     {
         this.canonicalRepository = canonicalRepository;
         this.dialogueSourceRepository = dialogueSourceRepository;
+        this.scanFileCacheRepository = scanFileCacheRepository;
+        this.options = options ?? new ScanOptions();
     }
 
     public async Task<DialogueSourceScanSummary> ScanAsync(string modsFolderPath)
     {
         DateTime scanTime = DateTime.UtcNow;
         int filesRead = 0;
-        ScanBudget budget = new(scanTime);
+        ScanBudget budget = new(scanTime, this.options.ScanTimeout);
         int sourcesFound = 0;
+        int sourcesDeactivated = 0;
         List<string> errors = new();
         List<string> warnings = new();
         List<string> diagnostics = new();
         List<DialogueSource> pendingSources = new();
         HashSet<(string? SourceModId, string FilePath)> scannedDialogueFiles = new();
+        HashSet<string> activeDialogueFilePaths = new(StringComparer.OrdinalIgnoreCase);
         HashSet<long> touchedCanonicalIds = new();
         string fullModsFolderPath = Path.GetFullPath(modsFolderPath);
         // Store the normalised root path on every source so queries can filter by origin later.
@@ -54,7 +63,8 @@ public sealed class DialogueSourceScannerService
             .ToDictionary(group => group.Key, group => group.First().Value, StringComparer.OrdinalIgnoreCase);
         Dictionary<string, CanonicalCharacter?> aliasLookupCache = new(StringComparer.OrdinalIgnoreCase);
 
-        foreach (string manifestPath in EnumerateFilesGuarded(fullModsFolderPath, "manifest.json", scanTime, errors, budget))
+        List<QueuedDialogueFile> queuedFiles = new();
+        foreach (string manifestPath in EnumerateFilesGuarded(fullModsFolderPath, "manifest.json", errors, budget))
         {
             string modDirectory = Path.GetDirectoryName(manifestPath) ?? "";
             ModManifest? manifest = ReadManifest(manifestPath);
@@ -62,101 +72,140 @@ public sealed class DialogueSourceScannerService
                 continue;
             IReadOnlyDictionary<string, string> i18n = ReadI18nDefaults(modDirectory);
 
-            foreach (string filePath in EnumerateFilesGuarded(modDirectory, "*.json", scanTime, errors, budget))
+            foreach (string filePath in EnumerateFilesGuarded(modDirectory, "*.json", errors, budget))
             {
                 if (!LooksDialogueRelated(filePath))
                     continue;
 
-                string rawJson;
-                DialogueParseResult parseResult;
-                try
+                queuedFiles.Add(new QueuedDialogueFile(filePath, manifest, i18n));
+                activeDialogueFilePaths.Add(filePath);
+                if (this.options.MaxDialogueFilesPerScan is int maxFiles && queuedFiles.Count >= maxFiles)
+                    break;
+            }
+
+            if (this.options.MaxDialogueFilesPerScan is int maxDialogueFiles && queuedFiles.Count >= maxDialogueFiles)
+                break;
+        }
+
+        budget.TotalFilesQueued = queuedFiles.Count;
+        if (this.options.MaxDialogueFilesPerScan is int maxDialogueFilesPerScan && queuedFiles.Count >= maxDialogueFilesPerScan)
+            warnings.Add($"Dialogue source scan limited to {maxDialogueFilesPerScan} queued file(s) by MaxDialogueFilesPerScan.");
+
+        for (int index = 0; index < queuedFiles.Count; index++)
+        {
+            if (!budget.CanContinue(errors, "Dialogue source scan", queuedFiles.Count - index))
+                break;
+
+            QueuedDialogueFile queued = queuedFiles[index];
+            budget.LastFileProcessed = queued.FilePath;
+            scannedDialogueFiles.Add((queued.Manifest.UniqueID, queued.FilePath));
+
+            try
+            {
+                FileInfo info = new(queued.FilePath);
+                ScanFileCacheEntry? cached = this.options.EnableScanCache && this.scanFileCacheRepository is not null
+                    ? await this.scanFileCacheRepository.GetAsync(DialogueCacheKind, queued.FilePath)
+                    : null;
+
+                if (cached is not null
+                    && cached.LastWriteUtcTicks == info.LastWriteTimeUtc.Ticks
+                    && cached.FileSize == info.Length)
                 {
-                    rawJson = File.ReadAllText(filePath);
-                    if (!PathLooksLikeDialogueAsset(filePath)
-                        && !rawJson.Contains("Characters/Dialogue", StringComparison.OrdinalIgnoreCase)
-                        && !rawJson.Contains("MarriageDialogue", StringComparison.OrdinalIgnoreCase))
+                    IReadOnlyList<DialogueSource> cachedSources = JsonSerializer.Deserialize<List<DialogueSource>>(cached.PayloadJson) ?? new List<DialogueSource>();
+                    foreach (DialogueSource source in cachedSources)
                     {
-                        continue;
+                        source.LastSeen = scanTime;
+                        pendingSources.Add(source);
+                        touchedCanonicalIds.Add(source.CanonicalCharacterId);
                     }
 
+                    sourcesFound += cachedSources.Count;
                     filesRead++;
-                    parseResult = TryParseDialogueJson(rawJson);
-                }
-                catch (Exception ex)
-                {
-                    errors.Add($"Skipped dialogue file '{filePath}': {ex.Message}");
+                    budget.FilesSkippedFromCache++;
                     continue;
                 }
 
-                IReadOnlyList<DialogueSource> extracted;
-                if (parseResult.Document is not null)
-                {
-                    using (parseResult.Document)
-                    {
-                        extracted = await ExtractSourcesAsync(parseResult.Document.RootElement, rawJson, filePath, manifest, scanTime, fullModsFolderPath, i18n, canonicalByName, aliasLookupCache);
-                    }
-                }
-                else
-                {
-                    extracted = await ExtractFallbackSourcesAsync(rawJson, filePath, manifest, scanTime, fullModsFolderPath, i18n, canonicalByName, aliasLookupCache);
-                }
+                ParsedDialogueFile parsed = await this.ParseDialogueFileWithTimeoutAsync(queued.FilePath);
+                if (!parsed.IsDialogueCandidate)
+                    continue;
 
-                string detectedCharacter = NameFromDialogueFilePath(filePath) ?? "(content patcher)";
-                scannedDialogueFiles.Add((manifest.UniqueID, filePath));
-                string warning = parseResult.Warning ?? "";
-                if (parseResult.Document is null && extracted.Count == 0 && !string.IsNullOrWhiteSpace(parseResult.Warning))
-                    errors.Add($"Skipped dialogue file '{filePath}': {parseResult.Warning}");
-                else if (!string.IsNullOrWhiteSpace(warning))
-                    diagnostics.Add($"Dialogue file '{filePath}' classified={ZeroLineClassification.LenientJsonRecovered}, parser='{parseResult.ParserUsed}', linesExtracted={extracted.Count}. Recovered from: {warning}");
+                filesRead++;
+                IReadOnlyList<DialogueSource> extracted = await this.ExtractDialogueSourcesFromParsedFileAsync(
+                    parsed,
+                    queued,
+                    scanTime,
+                    fullModsFolderPath,
+                    canonicalByName,
+                    aliasLookupCache,
+                    warnings,
+                    diagnostics,
+                    errors);
+                bool malformedWithoutRecovery = parsed.ParseResult.Document is null
+                    && extracted.Count == 0
+                    && !string.IsNullOrWhiteSpace(parsed.ParseResult.Warning);
 
                 foreach (DialogueSource source in extracted)
                 {
                     pendingSources.Add(source);
                     touchedCanonicalIds.Add(source.CanonicalCharacterId);
-                    sourcesFound++;
                 }
 
-                if (extracted.Count == 0 && parseResult.Document is not null)
+                sourcesFound += extracted.Count;
+                budget.FilesScanned++;
+                if (malformedWithoutRecovery)
+                    budget.FilesFailed++;
+
+                if (this.options.EnableScanCache && this.scanFileCacheRepository is not null)
                 {
-                    IReadOnlyList<DialogueSource> fallbackExtracted = await ExtractFallbackSourcesAsync(rawJson, filePath, manifest, scanTime, fullModsFolderPath, i18n, canonicalByName, aliasLookupCache);
-                    if (fallbackExtracted.Count > 0)
+                    await this.scanFileCacheRepository.UpsertAsync(new ScanFileCacheEntry
                     {
-                        warnings.Add($"Dialogue file '{filePath}' strict/lenient JSON produced 0 lines; fallback text extractor recovered {fallbackExtracted.Count} line(s).");
-                        foreach (DialogueSource source in fallbackExtracted)
-                        {
-                            pendingSources.Add(source);
-                            touchedCanonicalIds.Add(source.CanonicalCharacterId);
-                            sourcesFound++;
-                        }
-                    }
-                }
-
-                int finalExtractedCount = extracted.Count;
-                if (finalExtractedCount == 0)
-                {
-                    ZeroLineClassification classification = ClassifyZeroLineFile(filePath, rawJson, parseResult);
-                    string diagnostic = $"Dialogue file '{filePath}': detectedCharacter='{detectedCharacter}', parser='{parseResult.ParserUsed}', linesExtracted=0, classification={classification}.";
-                    if (classification == ZeroLineClassification.NoDialogueFound)
-                        warnings.Add(diagnostic);
-                    else
-                        System.Diagnostics.Debug.WriteLine($"[DialogueSourceScanner] {diagnostic}");
-                }
-                else
-                {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[DialogueSourceScanner] Dialogue file '{filePath}': detectedCharacter='{detectedCharacter}', parser='{parseResult.ParserUsed}', linesExtracted={finalExtractedCount}.");
+                        CacheKind = DialogueCacheKind,
+                        FilePath = queued.FilePath,
+                        SourceModId = queued.Manifest.UniqueID,
+                        LastWriteUtcTicks = info.LastWriteTimeUtc.Ticks,
+                        FileSize = info.Length,
+                        ContentHash = ComputeSha256(parsed.RawJson),
+                        PayloadJson = JsonSerializer.Serialize(extracted),
+                        UpdatedAt = DateTime.UtcNow
+                    });
                 }
             }
+            catch (TimeoutException ex)
+            {
+                budget.FilesFailed++;
+                errors.Add(ex.Message);
+            }
+            catch (Exception ex)
+            {
+                budget.FilesFailed++;
+                errors.Add($"Skipped dialogue file '{queued.FilePath}': {ex.Message}");
+            }
+
+            if (pendingSources.Count >= 500)
+                await FlushPendingSourcesAsync();
         }
 
-        await this.dialogueSourceRepository.UpsertRangeAsync(pendingSources);
-        int staleFileSourcesDeactivated = await this.dialogueSourceRepository.DeactivateStaleForScannedFilesAsync(scannedDialogueFiles, scanTime);
+        await FlushPendingSourcesAsync();
 
-        // Cascade mod-level deactivations down to dialogue sources. Any source whose SourceModId
-        // refers to a mod that ScannedModRepository.MarkMissingInactiveAsync has deactivated will
-        // be marked inactive here, so GetForCanonicalAsync(activeOnly:true) never returns stale
-        // sources from old or removed mods.
-        int sourcesDeactivated = staleFileSourcesDeactivated + await this.dialogueSourceRepository.DeactivateForInactiveModsAsync();
+        if (!budget.TimedOut)
+        {
+            int staleFileSourcesDeactivated = await this.dialogueSourceRepository.DeactivateStaleForScannedFilesAsync(scannedDialogueFiles, scanTime);
+            int missingFileSourcesDeactivated = await this.dialogueSourceRepository.DeactivateMissingFilesAsync(fullModsFolderPath, activeDialogueFilePaths);
+            if (this.options.EnableScanCache && this.scanFileCacheRepository is not null)
+                await this.scanFileCacheRepository.DeleteMissingAsync(DialogueCacheKind, activeDialogueFilePaths);
+
+            // Cascade mod-level deactivations down to dialogue sources. Any source whose SourceModId
+            // refers to a mod that ScannedModRepository.MarkMissingInactiveAsync has deactivated will
+            // be marked inactive here, so GetForCanonicalAsync(activeOnly:true) never returns stale
+            // sources from old or removed mods.
+            sourcesDeactivated = staleFileSourcesDeactivated
+                + missingFileSourcesDeactivated
+                + await this.dialogueSourceRepository.DeactivateForInactiveModsAsync();
+        }
+        else
+        {
+            errors.Add($"Dialogue source scan saved partial progress after timeout. Phase='dialogue source scan', lastFile='{budget.LastFileProcessed}', remainingFiles={budget.FilesRemaining}, databaseStatePartial=true.");
+        }
 
         foreach (long canonicalId in touchedCanonicalIds)
             await this.dialogueSourceRepository.UpsertSummaryAsync(BuildSummary(canonicalId, await this.dialogueSourceRepository.GetForCanonicalAsync(canonicalId, activeOnly: true, limit: 200)));
@@ -165,12 +214,30 @@ public sealed class DialogueSourceScannerService
         {
             FilesRead = filesRead,
             FilesInspected = budget.FilesInspected,
+            TotalFilesQueued = budget.TotalFilesQueued,
+            FilesScanned = budget.FilesScanned,
+            FilesSkippedFromCache = budget.FilesSkippedFromCache,
+            FilesFailed = budget.FilesFailed,
             SourcesFound = sourcesFound,
             SourcesDeactivated = sourcesDeactivated,
+            TimedOut = budget.TimedOut,
+            TimedOutPhase = budget.TimedOut ? "dialogue source scan" : "",
+            LastFileProcessed = budget.LastFileProcessed,
+            FilesRemaining = budget.FilesRemaining,
+            DatabaseStatePartial = budget.TimedOut,
             Errors = errors,
             Warnings = warnings,
             Diagnostics = diagnostics
         };
+
+        async Task FlushPendingSourcesAsync()
+        {
+            if (pendingSources.Count == 0)
+                return;
+
+            await this.dialogueSourceRepository.UpsertRangeAsync(pendingSources);
+            pendingSources.Clear();
+        }
     }
 
     private static DialogueSourceSummary BuildSummary(long canonicalId, IReadOnlyList<DialogueSource> sources)
@@ -204,6 +271,95 @@ public sealed class DialogueSourceScannerService
             ImportantCanonFacts = "Respect facts implied by existing dialogue keys, source mods, and user overrides. Do not contradict save state.",
             LastGeneratedAt = DateTime.UtcNow
         };
+    }
+
+    private async Task<ParsedDialogueFile> ParseDialogueFileWithTimeoutAsync(string filePath)
+    {
+        try
+        {
+            return await Task.Run(() =>
+            {
+                string rawJson = File.ReadAllText(filePath);
+                bool isDialogueCandidate = PathLooksLikeDialogueAsset(filePath)
+                    || rawJson.Contains("Characters/Dialogue", StringComparison.OrdinalIgnoreCase)
+                    || rawJson.Contains("MarriageDialogue", StringComparison.OrdinalIgnoreCase);
+                if (!isDialogueCandidate)
+                    return new ParsedDialogueFile(rawJson, new DialogueParseResult(null, "not dialogue", null), false);
+
+                return new ParsedDialogueFile(rawJson, TryParseDialogueJson(rawJson), true);
+            }).WaitAsync(this.options.PerFileParseTimeout);
+        }
+        catch (TimeoutException)
+        {
+            throw new TimeoutException($"Skipped dialogue file '{filePath}': parse exceeded {this.options.PerFileParseTimeout.TotalMilliseconds:0}ms per-file limit.");
+        }
+    }
+
+    private async Task<IReadOnlyList<DialogueSource>> ExtractDialogueSourcesFromParsedFileAsync(
+        ParsedDialogueFile parsed,
+        QueuedDialogueFile queued,
+        DateTime scanTime,
+        string sourceRootPath,
+        IReadOnlyDictionary<string, CanonicalCharacter> canonicalByName,
+        Dictionary<string, CanonicalCharacter?> aliasLookupCache,
+        List<string> warnings,
+        List<string> diagnostics,
+        List<string> errors)
+    {
+        DialogueParseResult parseResult = parsed.ParseResult;
+        IReadOnlyList<DialogueSource> extracted;
+        if (parseResult.Document is not null)
+        {
+            using (parseResult.Document)
+            {
+                extracted = await ExtractSourcesAsync(parseResult.Document.RootElement, parsed.RawJson, queued.FilePath, queued.Manifest, scanTime, sourceRootPath, queued.I18n, canonicalByName, aliasLookupCache);
+            }
+        }
+        else
+        {
+            extracted = await ExtractFallbackSourcesAsync(parsed.RawJson, queued.FilePath, queued.Manifest, scanTime, sourceRootPath, queued.I18n, canonicalByName, aliasLookupCache);
+        }
+
+        string detectedCharacter = NameFromDialogueFilePath(queued.FilePath) ?? "(content patcher)";
+        string warning = parseResult.Warning ?? "";
+        if (parseResult.Document is null && extracted.Count == 0 && !string.IsNullOrWhiteSpace(parseResult.Warning))
+            errors.Add($"Skipped dialogue file '{queued.FilePath}': {parseResult.Warning}");
+        else if (!string.IsNullOrWhiteSpace(warning))
+            diagnostics.Add($"Dialogue file '{queued.FilePath}' classified={ZeroLineClassification.LenientJsonRecovered}, parser='{parseResult.ParserUsed}', linesExtracted={extracted.Count}. Recovered from: {warning}");
+
+        List<DialogueSource> finalSources = new(extracted);
+        if (extracted.Count == 0 && parseResult.Document is not null)
+        {
+            IReadOnlyList<DialogueSource> fallbackExtracted = await ExtractFallbackSourcesAsync(parsed.RawJson, queued.FilePath, queued.Manifest, scanTime, sourceRootPath, queued.I18n, canonicalByName, aliasLookupCache);
+            if (fallbackExtracted.Count > 0)
+            {
+                warnings.Add($"Dialogue file '{queued.FilePath}' strict/lenient JSON produced 0 lines; fallback text extractor recovered {fallbackExtracted.Count} line(s).");
+                finalSources.AddRange(fallbackExtracted);
+            }
+        }
+
+        if (finalSources.Count == 0)
+        {
+            ZeroLineClassification classification = ClassifyZeroLineFile(queued.FilePath, parsed.RawJson, parseResult);
+            string diagnostic = $"Dialogue file '{queued.FilePath}': detectedCharacter='{detectedCharacter}', parser='{parseResult.ParserUsed}', linesExtracted=0, classification={classification}.";
+            if (classification == ZeroLineClassification.NoDialogueFound)
+                warnings.Add(diagnostic);
+            else
+                System.Diagnostics.Debug.WriteLine($"[DialogueSourceScanner] {diagnostic}");
+        }
+        else
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[DialogueSourceScanner] Dialogue file '{queued.FilePath}': detectedCharacter='{detectedCharacter}', parser='{parseResult.ParserUsed}', linesExtracted={finalSources.Count}.");
+        }
+
+        return finalSources;
+    }
+
+    private static string ComputeSha256(string text)
+    {
+        byte[] hash = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text));
+        return Convert.ToHexString(hash);
     }
 
     private async Task<IReadOnlyList<DialogueSource>> ExtractSourcesAsync(
@@ -928,11 +1084,12 @@ public sealed class DialogueSourceScannerService
 
     private sealed record ModManifest(string Name, string UniqueID, string? Version, string? Author);
     private sealed record DialogueParseResult(JsonDocument? Document, string ParserUsed, string? Warning);
+    private sealed record ParsedDialogueFile(string RawJson, DialogueParseResult ParseResult, bool IsDialogueCandidate);
+    private sealed record QueuedDialogueFile(string FilePath, ModManifest Manifest, IReadOnlyDictionary<string, string> I18n);
 
     private static IEnumerable<string> EnumerateFilesGuarded(
         string rootPath,
         string searchPattern,
-        DateTime startedAt,
         List<string> errors,
         ScanBudget budget)
     {
@@ -947,9 +1104,11 @@ public sealed class DialogueSourceScannerService
                 yield break;
             }
 
-            if (DateTime.UtcNow - startedAt > MaxScanDuration)
+            if (DateTime.UtcNow - budget.StartedAt > budget.Timeout)
             {
-                errors.Add($"Dialogue source scan stopped after {MaxScanDuration.TotalSeconds:0}s safety limit.");
+                budget.TimedOut = true;
+                budget.FilesRemaining = pending.Count;
+                errors.Add($"Dialogue source scan stopped during file discovery after {budget.Timeout.TotalSeconds:0}s safety limit. Remaining folders queued: {budget.FilesRemaining}.");
                 yield break;
             }
 
@@ -1009,13 +1168,33 @@ public sealed class DialogueSourceScannerService
 
     private sealed class ScanBudget
     {
-        public ScanBudget(DateTime startedAt)
+        public ScanBudget(DateTime startedAt, TimeSpan timeout)
         {
             this.StartedAt = startedAt;
+            this.Timeout = timeout;
         }
 
         public DateTime StartedAt { get; }
+        public TimeSpan Timeout { get; }
+        public int TotalFilesQueued { get; set; }
         public int FilesInspected { get; set; }
+        public int FilesScanned { get; set; }
+        public int FilesSkippedFromCache { get; set; }
+        public int FilesFailed { get; set; }
+        public bool TimedOut { get; set; }
+        public string LastFileProcessed { get; set; } = "";
+        public int FilesRemaining { get; set; }
+
+        public bool CanContinue(List<string> errors, string phase, int filesRemaining)
+        {
+            if (DateTime.UtcNow - this.StartedAt <= this.Timeout)
+                return true;
+
+            this.TimedOut = true;
+            this.FilesRemaining = filesRemaining;
+            errors.Add($"{phase} stopped after {this.Timeout.TotalSeconds:0}s safety limit. Last file processed: '{this.LastFileProcessed}'. Files remaining: {filesRemaining}.");
+            return false;
+        }
     }
 }
 
@@ -1023,8 +1202,17 @@ public sealed class DialogueSourceScanSummary
 {
     public int FilesRead { get; set; }
     public int FilesInspected { get; set; }
+    public int TotalFilesQueued { get; set; }
+    public int FilesScanned { get; set; }
+    public int FilesSkippedFromCache { get; set; }
+    public int FilesFailed { get; set; }
     public int SourcesFound { get; set; }
     public int SourcesDeactivated { get; set; }
+    public bool TimedOut { get; set; }
+    public string TimedOutPhase { get; set; } = "";
+    public string LastFileProcessed { get; set; } = "";
+    public int FilesRemaining { get; set; }
+    public bool DatabaseStatePartial { get; set; }
     public IReadOnlyList<string> Errors { get; set; } = Array.Empty<string>();
     public IReadOnlyList<string> Warnings { get; set; } = Array.Empty<string>();
     public IReadOnlyList<string> Diagnostics { get; set; } = Array.Empty<string>();

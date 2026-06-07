@@ -383,4 +383,284 @@ public sealed class DialogueContextSelectionServiceTests
         Assert.False(string.IsNullOrWhiteSpace(selected[0].ScoreBreakdown));
         Assert.Contains("Priority:", selected[0].ScoreBreakdown);
     }
+
+    // ── Bad_* hard-exclusion for non-spouse scenes ────────────────────────────
+
+    [Fact]
+    public void LanceDating10Hearts_ExcludesBadMoodLines_Entirely()
+    {
+        // Lance at 10 hearts dating — Bad_* must not appear at all (not even voice-only).
+        var marriageFilePath = @"Mods\SomeMod\assets\Dialogue\Lance\MarriageDialogueLance.json";
+        var sources = new[]
+        {
+            MakeSource("Bad_0", "I don't want to talk right now.",
+                filePath: marriageFilePath, priority: 70),
+            MakeSource("Bad_1", "Leave me alone for a while.",
+                filePath: marriageFilePath, priority: 70),
+            MakeSource("Bad_2", "I'm not in the mood.",
+                filePath: marriageFilePath, priority: 70),
+            MakeSource("spring_0", "The highlands call to me this time of year.",
+                season: "spring", priority: 60),
+            MakeSource("casual_0", "You seem to have something on your mind.",
+                priority: 50),
+        };
+        var context = MakeContext(topic: "general", season: "spring", hearts: 10,
+            location: "AdventureGuild");
+        var lore = MakeLore(sources, relState: "dating");
+
+        var selected = Service.SelectRelevantDialogueSources(context, lore, limit: 5);
+
+        Assert.True(
+            !selected.Any(s => DialogueContextSelectionService.IsBadMoodKey(s.Source.DialogueKey)),
+            "Bad_* lines must be completely excluded for a dating scene, not even voice-only");
+    }
+
+    [Fact]
+    public void LanceDating10Hearts_MarriageDialogue_AllowedAsVoiceOnly_IfNoAlternative()
+    {
+        // Non-bad marriage dialogue is allowed as voice-only fallback when the pool is thin.
+        var marriageFilePath = @"Mods\SomeMod\assets\Dialogue\Lance\MarriageDialogueLance.json";
+        var sources = new[]
+        {
+            MakeSource("Indoor_Day_0", "Morning, sweetheart.",
+                filePath: marriageFilePath, priority: 70),
+            MakeSource("Good_0", "I'm glad you're here.",
+                filePath: marriageFilePath, priority: 70),
+        };
+        var context = MakeContext(topic: "general", hearts: 10);
+        var lore = MakeLore(sources, relState: "dating");
+
+        var selected = Service.SelectRelevantDialogueSources(context, lore, limit: 5);
+
+        // None are Bad_* — they're spouse context but not bad-mood, so they're allowed as voice-only.
+        Assert.DoesNotContain(selected,
+            s => DialogueContextSelectionService.IsBadMoodKey(s.Source.DialogueKey));
+        // They should be flagged voice-only since the player isn't the spouse.
+        Assert.All(selected, s => Assert.True(s.IsVoiceOnlyFallback,
+            "Non-spouse marriage dialogue should be voice-only for a dating scene"));
+    }
+
+    [Fact]
+    public void LanceMarriedHighHearts_BadMoodPenalised_NotPrimary()
+    {
+        // Married at 10 hearts — Bad_* should be deprioritised vs Good_*.
+        var marriageFilePath = @"Mods\SomeMod\assets\Dialogue\Lance\MarriageDialogueLance.json";
+        var sources = new[]
+        {
+            MakeSource("Bad_0", "I don't want to talk right now.",
+                filePath: marriageFilePath, priority: 60),
+            MakeSource("Good_0", "Today's a good day. I can feel it.",
+                filePath: marriageFilePath, priority: 60),
+            MakeSource("Neutral_0", "Back already?",
+                filePath: marriageFilePath, priority: 60),
+        };
+        var context = MakeContext(topic: "spouse", hearts: 10);
+        var lore = MakeLore(sources, relState: "spouse");
+
+        var selected = Service.SelectRelevantDialogueSources(context, lore, limit: 3);
+
+        var badLine  = selected.FirstOrDefault(s => s.Source.DialogueKey == "Bad_0");
+        var goodLine = selected.FirstOrDefault(s => s.Source.DialogueKey == "Good_0");
+
+        Assert.NotNull(goodLine);
+        if (badLine is not null)
+            Assert.True(goodLine.TotalScore > badLine.TotalScore,
+                "Good_* should outscore Bad_* at high friendship hearts");
+    }
+
+    [Fact]
+    public void LanceMarriedHighHearts_GoodMoodGetsBonus()
+    {
+        // Good_* should have a higher scene score than Bad_* for a high-heart spouse.
+        var marriageFilePath = @"Mods\SomeMod\assets\Dialogue\Lance\MarriageDialogueLance.json";
+        var goodSource = MakeSource("Good_0", "Today's a good day. I can feel it.",
+            filePath: marriageFilePath, priority: 60);
+        var badSource  = MakeSource("Bad_0", "I don't want to talk right now.",
+            filePath: marriageFilePath, priority: 60);
+
+        var context = MakeContext(topic: "spouse", hearts: 10);
+        var lore = MakeLore(
+            new[] { goodSource, badSource },
+            relState: "spouse");
+
+        var (_, goodScene, _, _) = DialogueContextSelectionService.ScoreSourceWithBreakdown(
+            goodSource, context, lore, "spouse");
+        var (_, badScene, _, _) = DialogueContextSelectionService.ScoreSourceWithBreakdown(
+            badSource, context, lore, "spouse");
+
+        Assert.True(goodScene > badScene,
+            $"Good_* scene score ({goodScene}) should exceed Bad_* scene score ({badScene}) at 10 hearts");
+    }
+
+    [Fact]
+    public void LanceMarriedLowHearts_BadMoodAllowed()
+    {
+        // Married at 4 hearts (strained) — Bad_* should not be penalised.
+        var marriageFilePath = @"Mods\SomeMod\assets\Dialogue\Lance\MarriageDialogueLance.json";
+        var badSource = MakeSource("Bad_0", "I don't want to talk right now.",
+            filePath: marriageFilePath, priority: 60);
+
+        var context = MakeContext(topic: "spouse", hearts: 4);
+        var lore = MakeLore(new[] { badSource }, relState: "spouse");
+
+        var (_, sceneScore, breakdown, voiceOnly) = DialogueContextSelectionService.ScoreSourceWithBreakdown(
+            badSource, context, lore, "spouse");
+
+        // No bad-mood penalty should be applied for a low-heart spouse.
+        Assert.False(breakdown.Contains("-BadMood"), $"Bad_* should not be penalised at low hearts. Breakdown: {breakdown}");
+        // It may still be voice-only for other reasons, but the bad-mood penalty itself should be absent.
+    }
+
+    [Fact]
+    public void LanceMarriedLowHearts_BadMoodIncludedInSelection()
+    {
+        // With strained marriage, Bad_* should surface in selected sources.
+        var marriageFilePath = @"Mods\SomeMod\assets\Dialogue\Lance\MarriageDialogueLance.json";
+        var sources = new[]
+        {
+            MakeSource("Bad_0", "I don't want to talk right now.",
+                filePath: marriageFilePath, priority: 60),
+            MakeSource("Neutral_0", "Back already?",
+                filePath: marriageFilePath, priority: 60),
+        };
+        var context = MakeContext(topic: "spouse", hearts: 4);
+        var lore = MakeLore(sources, relState: "spouse");
+
+        var selected = Service.SelectRelevantDialogueSources(context, lore, limit: 2);
+
+        Assert.True(
+            selected.Any(s => s.Source.DialogueKey == "Bad_0"),
+            "Bad_* should be selectable when the player is a low-heart spouse");
+    }
+
+    [Fact]
+    public void NeutralMoodKey_GetsBonus_ForSpouseScene()
+    {
+        // Neutral_* should get a scene bonus vs a plain line at equal base priority.
+        var marriageFilePath = @"Mods\SomeMod\assets\Dialogue\Lance\MarriageDialogueLance.json";
+        var neutralSource = MakeSource("Neutral_0", "Back already?",
+            filePath: marriageFilePath, priority: 50);
+        var plainSource = MakeSource("casual_0", "Looking for something?",
+            priority: 50);
+
+        var context = MakeContext(topic: "spouse", hearts: 7);
+        var lore = MakeLore(new[] { neutralSource, plainSource }, relState: "spouse");
+
+        var (_, neutralScene, _, _) = DialogueContextSelectionService.ScoreSourceWithBreakdown(
+            neutralSource, context, lore, "spouse");
+        var (_, plainScene, _, _) = DialogueContextSelectionService.ScoreSourceWithBreakdown(
+            plainSource, context, lore, "spouse");
+
+        Assert.True(neutralScene > plainScene,
+            $"Neutral_* scene score ({neutralScene}) should exceed plain line scene score ({plainScene}) for a spouse scene");
+    }
+
+    // ── Comprehensive negative-pattern guard ──────────────────────────────────
+
+    [Fact]
+    public void GeneralSunnyDay_ExcludesAllNegativePatterns()
+    {
+        // A general sunny-day interaction should produce ZERO Bad_*, gift, birthday,
+        // or rejection lines in the selection.
+        var marriageFilePath = @"Mods\SomeMod\assets\Dialogue\Lance\MarriageDialogueLance.json";
+        var sources = new[]
+        {
+            MakeSource("Bad_0", "I don't want to talk right now.",
+                filePath: marriageFilePath, priority: 90),
+            MakeSource("Bad_3", "Not now.",
+                filePath: marriageFilePath, priority: 90),
+            MakeSource("AcceptGift", "Thank you for this.", priority: 85),
+            MakeSource("AcceptBirthdayGift", "On my birthday!", priority: 85),
+            MakeSource("RejectGift", "I can't accept this.", priority: 85),
+            MakeSource("spring_0", "The highlands call to me this time of year.",
+                season: "spring", priority: 60),
+            MakeSource("sunny_0", "Clear skies — good day for a patrol.",
+                weather: "sunny", priority: 60),
+            MakeSource("casual_0", "You seem to have something on your mind.", priority: 50),
+        };
+        var context = MakeContext(topic: "general", season: "spring", weather: "sunny", hearts: 10);
+        var lore = MakeLore(sources, relState: "dating");
+
+        // limit: 3 → only the highest-scoring sources; spring/sunny/casual lines all outscore
+        // the penalised gift and rejection lines, so those should not appear.
+        var selected = Service.SelectRelevantDialogueSources(context, lore, limit: 3);
+
+        Assert.True(
+            !selected.Any(s => DialogueContextSelectionService.IsBadMoodKey(s.Source.DialogueKey)),
+            "Bad_* must be completely absent from a general dating scene");
+        Assert.True(
+            !selected.Any(s => DialogueContextSelectionService.IsAcceptGiftKey(s.Source.DialogueKey)),
+            "AcceptGift lines must not appear when better scene-relevant sources exist");
+        Assert.True(
+            !selected.Any(s => DialogueContextSelectionService.IsRejectionKey(s.Source.DialogueKey)),
+            "Rejection lines must not appear when better scene-relevant sources exist");
+    }
+
+    // ── Debug breakdown labels ─────────────────────────────────────────────────
+
+    [Fact]
+    public void GiftMismatch_BreakdownContainsGiftContextLabel()
+    {
+        var source = MakeSource("AcceptGift", "Thank you for this.", priority: 60);
+        var context = MakeContext(topic: "general"); // not a gift scene
+        var lore = MakeLore(new[] { source }, relState: "friend");
+
+        var (_, _, breakdown, _) = DialogueContextSelectionService.ScoreSourceWithBreakdown(
+            source, context, lore, "friend");
+
+        Assert.True(breakdown.Contains("excluded:gift-context-mismatch"),
+            $"Breakdown should tag gift key mismatch with debug label. Got: {breakdown}");
+    }
+
+    [Fact]
+    public void SpouseMismatch_BreakdownContainsSpouseContextLabel()
+    {
+        var source = MakeSource("Indoor_Day_0", "Good morning, sweetheart.",
+            filePath: @"Mods\TestMod\assets\Dialogue\Wizard\MarriageDialogueWizard.json",
+            priority: 60);
+        var context = MakeContext(topic: "general");
+        var lore = MakeLore(new[] { source }, relState: "friend");
+
+        var (_, _, breakdown, _) = DialogueContextSelectionService.ScoreSourceWithBreakdown(
+            source, context, lore, "friend");
+
+        Assert.True(breakdown.Contains("excluded:spouse-context-mismatch"),
+            $"Breakdown should tag spouse key mismatch with debug label. Got: {breakdown}");
+    }
+
+    [Fact]
+    public void BadMoodNonSpouse_ScoreSourceSafetyNet_ContainsBadMoodMismatchLabel()
+    {
+        // ScoreSourceWithBreakdown contains a safety-net penalty for Bad_* non-spouse in case
+        // a custom key escapes the hard pre-filter (e.g. a mod that uses Bad_* in a general file).
+        // Call the scoring method directly (bypassing the pre-filter) to verify the label.
+        var source = MakeSource("Bad_0", "I don't want to talk right now.", priority: 60);
+        var context = MakeContext(topic: "general");
+        var lore = MakeLore(new[] { source }, relState: "friend");
+
+        // Invoke scoring directly — the pre-filter is in SelectRelevantDialogueSources,
+        // not in ScoreSourceWithBreakdown.
+        var (_, _, breakdown, _) = DialogueContextSelectionService.ScoreSourceWithBreakdown(
+            source, context, lore, "friend");
+
+        Assert.True(breakdown.Contains("excluded:bad-mood-mismatch"),
+            $"Safety-net penalty should tag bad-mood-mismatch label. Got: {breakdown}");
+    }
+
+    [Fact]
+    public void VoiceOnlyFallback_BreakdownContainsVoiceOnlyLabel()
+    {
+        var source = MakeSource("Indoor_Day_0", "Good morning, sweetheart.",
+            filePath: @"Mods\TestMod\assets\Dialogue\Wizard\MarriageDialogueWizard.json",
+            priority: 60);
+        var context = MakeContext(topic: "general");
+        var lore = MakeLore(new[] { source }, relState: "friend");
+
+        var (_, _, breakdown, voiceOnly) = DialogueContextSelectionService.ScoreSourceWithBreakdown(
+            source, context, lore, "friend");
+
+        Assert.True(voiceOnly);
+        Assert.True(breakdown.Contains("included:voice-only-fallback"),
+            $"Breakdown should tag voice-only sources. Got: {breakdown}");
+    }
 }

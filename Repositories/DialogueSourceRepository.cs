@@ -235,6 +235,49 @@ public sealed class DialogueSourceRepository
         return await command.ExecuteNonQueryAsync();
     }
 
+    public async Task<int> DeactivateMissingFilesAsync(string sourceRootPath, IEnumerable<string> activeFilePaths)
+    {
+        HashSet<string> active = activeFilePaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+
+        List<string> storedFiles = new();
+        await using (SqliteCommand select = connection.CreateCommand())
+        {
+            select.CommandText = @"
+                SELECT DISTINCT FilePath
+                FROM DialogueSources
+                WHERE IsActive = 1
+                  AND IFNULL(SourceRootPath, '') = @sourceRootPath
+                  AND SourceModId IS NOT NULL
+                  AND SourceModId NOT LIKE 'StardewValley.%';
+                ";
+            select.Parameters.AddWithValue("@sourceRootPath", sourceRootPath);
+            await using SqliteDataReader reader = await select.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+                storedFiles.Add(reader.GetString(0));
+        }
+
+        int deactivated = 0;
+        foreach (string filePath in storedFiles.Where(path => !active.Contains(path)))
+        {
+            await using SqliteCommand update = connection.CreateCommand();
+            update.CommandText = @"
+                UPDATE DialogueSources
+                SET IsActive = 0, UpdatedAt = @timestamp
+                WHERE FilePath = @filePath
+                  AND IFNULL(SourceRootPath, '') = @sourceRootPath
+                  AND IsActive = 1;
+                ";
+            update.Parameters.AddWithValue("@filePath", filePath);
+            update.Parameters.AddWithValue("@sourceRootPath", sourceRootPath);
+            update.Parameters.AddWithValue("@timestamp", DateTime.UtcNow.ToString("O"));
+            deactivated += await update.ExecuteNonQueryAsync();
+        }
+
+        return deactivated;
+    }
+
     /// <summary>Returns the number of active dialogue sources for a canonical character.</summary>
     public async Task<int> CountActiveForCanonicalAsync(long canonicalCharacterId)
     {

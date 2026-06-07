@@ -15,6 +15,28 @@
             <h3 id="profile-form-title">Create Player Profile</h3>
             <form id="profile-form">
                 <input type="hidden" name="id">
+                <section class="profile-ai-draft" aria-labelledby="profile-ai-title">
+                    <div class="panel-header">
+                        <div>
+                            <h4 id="profile-ai-title">AI Autocomplete</h4>
+                            <small>Describe your farmer in a few words, and Living Lore will draft the profile.</small>
+                        </div>
+                    </div>
+                    <label>Profile concept
+                        <textarea id="profile-concept" maxlength="500" placeholder="new sorceress in the valley, military personality"></textarea>
+                    </label>
+                    <div class="draft-options" role="radiogroup" aria-label="Profile generation mode">
+                        <label class="checkbox"><input type="radio" name="profileGenerationMode" value="blank" checked> Only fill blank fields</label>
+                        <label class="checkbox"><input type="radio" name="profileGenerationMode" value="overwrite"> Overwrite existing fields</label>
+                    </div>
+                    <div class="action-row">
+                        <button type="button" id="profile-generate">Generate Profile</button>
+                        <button type="button" id="profile-regenerate" class="secondary" hidden>Regenerate</button>
+                        <button type="button" id="profile-clear-generated" class="secondary" hidden>Clear generated fields</button>
+                    </div>
+                    <div id="profile-ai-preview" class="draft-preview" hidden></div>
+                    <span id="profile-ai-status" class="status"></span>
+                </section>
                 <label>Profile Name <input name="profileName" required></label>
                 <label>Farmer Name <input name="farmerName" required></label>
                 <label>Farm Name <input name="farmName" required></label>
