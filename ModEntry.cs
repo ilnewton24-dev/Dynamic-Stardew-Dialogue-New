@@ -6,6 +6,7 @@ using LivingLoreDialogue.Models;
 using LivingLoreDialogue.Repositories;
 using LivingLoreDialogue.Services;
 using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
@@ -27,6 +28,15 @@ public sealed class ModEntry : Mod
     private BranchingDialogueSession? activeBranchingSession;
     private NPC? activeBranchingNpc;
     private IReadOnlyList<PlayerDialogueOption> activeBranchingOptions = Array.Empty<PlayerDialogueOption>();
+    private string activeBranchingPrompt = "";
+    private BranchingUiState branchingUiState = BranchingUiState.ConversationEnded;
+    private IReadOnlyList<PlayerDialogueOption> pendingBranchingOptions = Array.Empty<PlayerDialogueOption>();
+    private string pendingBranchingNpcResponse = "";
+    private string? pendingBranchingEndReason;
+    private DateTime branchingTypingStartedAt = DateTime.MinValue;
+    private bool branchingConversationLockActive;
+    private bool branchingCleanupInProgress;
+    private bool branchingAwaitingResponse;
 
     // Names that are locations/buildings/objects, never valid dialogue characters.
     private static readonly HashSet<string> BlockedSpeakerNames = new(StringComparer.OrdinalIgnoreCase)
@@ -50,6 +60,15 @@ public sealed class ModEntry : Mod
     private const double PostDisplaySuppressionMs = 400;
     private DateTime suppressActionUntil = DateTime.MinValue;
     private bool suppressionWindowActive;
+
+    private enum BranchingUiState
+    {
+        ChoosingOption,
+        WaitingForApiResponse,
+        TypingNpcResponse,
+        ShowingPlayerOptions,
+        ConversationEnded
+    }
 
     // In-memory cache of active character names, refreshed on save load / after scans. The Harmony
     // prefix must decide eligibility synchronously, so it cannot query the database directly.
@@ -108,6 +127,7 @@ public sealed class ModEntry : Mod
         helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
         helper.Events.Input.ButtonPressed += this.OnButtonPressed;
         helper.Events.Display.MenuChanged += this.OnMenuChanged;
+        helper.Events.Display.RenderedActiveMenu += this.OnRenderedActiveMenu;
         helper.Events.Player.Warped += this.OnWarped;
         this.Monitor.Log("Events subscribed: GameLaunched, SaveLoaded, UpdateTicked, Input.ButtonPressed, Display.MenuChanged, Player.Warped.", LogLevel.Info);
 
@@ -384,6 +404,89 @@ public sealed class ModEntry : Mod
             this.Monitor.Log($"[Event] Player warped to '{e.NewLocation?.NameOrUniqueName}' with {CountVillagers(e.NewLocation)} villager(s).", LogLevel.Trace);
     }
 
+    private void OnRenderedActiveMenu(object? sender, RenderedActiveMenuEventArgs e)
+    {
+        try
+        {
+            if (this.activeBranchingSession?.IsActive != true || this.activeBranchingNpc is null)
+                return;
+
+            this.DrawBranchingNpcPortrait(e.SpriteBatch, this.activeBranchingSession, this.activeBranchingNpc);
+        }
+        catch (Exception ex)
+        {
+            if (this.config.DebugLogging)
+                this.Monitor.Log($"[BranchingUI] Failed to draw persistent NPC portrait: {ex.Message}", LogLevel.Trace);
+        }
+    }
+
+    private void DrawBranchingNpcPortrait(SpriteBatch spriteBatch, BranchingDialogueSession session, NPC npc)
+    {
+        Texture2D? portrait = TryGetNpcPortrait(npc);
+
+        if (portrait is null)
+            return;
+
+        int scale = 4;
+        int portraitSize = 64 * scale;
+        int margin = 48;
+        int x = Math.Max(margin, Game1.uiViewport.Width - portraitSize - margin);
+        int y = 96;
+        Rectangle panel = new(x - 16, y - 52, portraitSize + 32, portraitSize + 76);
+
+        IClickableMenu.drawTextureBox(
+            spriteBatch,
+            Game1.menuTexture,
+            new Rectangle(0, 256, 60, 60),
+            panel.X,
+            panel.Y,
+            panel.Width,
+            panel.Height,
+            Color.White,
+            1f,
+            drawShadow: true);
+
+        spriteBatch.Draw(
+            portrait,
+            new Rectangle(x, y, portraitSize, portraitSize),
+            new Rectangle(0, 0, 64, 64),
+            Color.White);
+
+        string name = string.IsNullOrWhiteSpace(session.NpcDisplayName) ? npc.displayName ?? npc.Name : session.NpcDisplayName;
+        Vector2 nameSize = Game1.smallFont.MeasureString(name);
+        Utility.drawTextWithShadow(
+            spriteBatch,
+            name,
+            Game1.smallFont,
+            new Vector2(panel.Center.X - nameSize.X / 2f, panel.Y + 16),
+            Game1.textColor);
+    }
+
+    private static Texture2D? TryGetNpcPortrait(NPC npc)
+    {
+        try
+        {
+            const System.Reflection.BindingFlags flags =
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance;
+
+            System.Reflection.PropertyInfo? property = npc.GetType().GetProperty("Portrait", flags);
+            if (property?.GetValue(npc) is Texture2D propertyPortrait)
+                return propertyPortrait;
+
+            System.Reflection.FieldInfo? field = npc.GetType().GetField("Portrait", flags);
+            if (field?.GetValue(npc) is Texture2D fieldPortrait)
+                return fieldPortrait;
+        }
+        catch
+        {
+            // Portraits are visual polish; missing/renamed portrait members should not break dialogue.
+        }
+
+        return null;
+    }
+
     // Runs every tick on the game thread; flush any dialogue queued by background generation tasks.
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
     {
@@ -398,6 +501,12 @@ public sealed class ModEntry : Mod
         {
             this.suppressionWindowActive = false;
             this.Monitor.Log("[Input suppression] Ended; action buttons re-enabled for dialogue.", LogLevel.Info);
+        }
+
+        if (this.activeBranchingSession?.IsActive == true)
+        {
+            this.ApplyBranchingConversationLock("update tick");
+            this.UpdateBranchingTypingState();
         }
 
         if (e.IsMultipleOf(60))
@@ -775,6 +884,13 @@ public sealed class ModEntry : Mod
                 return;
             }
 
+            if (this.activeBranchingSession?.IsActive == true && this.branchingAwaitingResponse && e.Button.IsActionButton())
+            {
+                this.Helper.Input.Suppress(e.Button);
+                this.Monitor.Log($"[Branching] Suppressed {e.Button} while waiting for API response.", LogLevel.Trace);
+                return;
+            }
+
             if (!Context.IsWorldReady || !e.Button.IsActionButton())
                 return;
 
@@ -807,6 +923,14 @@ public sealed class ModEntry : Mod
                 $"[MenuChanged] DialogueBox opened. currentSpeaker name='{speaker?.Name ?? "null"}', " +
                 $"display='{speaker?.displayName ?? "null"}', text='{Preview(GetCurrentDialogueText())}'.",
                 LogLevel.Info);
+
+            if (this.activeBranchingSession?.IsActive == true)
+            {
+                this.Monitor.Log(
+                    $"[MenuChanged] Ignoring DialogueBox during active branching session={this.activeBranchingSession.SessionId}; prevents continuity reset.",
+                    LogLevel.Trace);
+                return;
+            }
 
             // Tasks 3/8: no NPC speaker means this is not a character conversation (sign, letter,
             // event, our own generated box, etc.). Leave vanilla alone.
@@ -993,6 +1117,7 @@ public sealed class ModEntry : Mod
         this.activeBranchingNpc = npc;
         this.pendingRequestId = requestId;
         this.MarkHandled(npc.Name);
+        this.AcquireBranchingConversationLock(session, npc, "conversation start");
         this.Monitor.Log(
             $"[Branching] Conversation start session={session.SessionId}, npc={session.NpcName}, player={session.PlayerName}, hearts={save.FriendshipHearts}, relationship={save.RelationshipState}, location={save.Location}.",
             LogLevel.Info);
@@ -1010,6 +1135,7 @@ public sealed class ModEntry : Mod
         DialogueContext context = this.BuildContext(npc, "branching conversation", "SMAPI-Branching");
         BranchingDialogueRequest request = new()
         {
+            SessionId = session.SessionId,
             Context = context,
             SaveContext = context.SaveContext,
             Mode = mode,
@@ -1022,6 +1148,10 @@ public sealed class ModEntry : Mod
 
         if (selectedOption is not null)
             this.Monitor.Log($"[Branching] Selected player choice session={session.SessionId}, npc={session.NpcName}, id={selectedOption.Id}, text={Preview(selectedOption.Text)}.", LogLevel.Info);
+        this.Monitor.Log(
+            $"[Branching] Request context session={session.SessionId}, mode={mode}, turnCount={session.TurnCount}, selected='{Preview(selectedOption?.Text ?? "")}', historyEntries={session.Turns.Count}, latestPlayer='{Preview(session.Turns.LastOrDefault()?.PlayerChoiceText ?? "")}', latestNpc='{Preview(session.Turns.LastOrDefault()?.NpcResponse ?? "")}', recentHistory='{Preview(FormatRecentBranchingHistory(session))}'.",
+            LogLevel.Info);
+        this.EnterBranchingWaitingState(session, npc, selectedOption is null ? "opening options" : "selected option");
 
         _ = Task.Run(async () =>
         {
@@ -1030,6 +1160,7 @@ public sealed class ModEntry : Mod
                 : await this.localDialogueApiClient.GenerateBranchingAsync(request, "SMAPI-Branching");
 
             response ??= CreateFallbackBranchingResponse(mode);
+            EnsureFiveBranchingOptions(response, mode);
             if (!string.IsNullOrWhiteSpace(response.Error))
                 this.Monitor.Log($"[Branching] API request returned fallback/error session={session.SessionId}: {response.Error}", LogLevel.Warn);
             else
@@ -1048,6 +1179,7 @@ public sealed class ModEntry : Mod
                     this.Monitor.Log($"[Branching] Malformed response handling session={session.SessionId}: no player options.", LogLevel.Warn);
                     response = CreateFallbackBranchingResponse(mode);
                 }
+                EnsureFiveBranchingOptions(response, mode);
 
                 session.PlayerProfileName = response.ActivePlayerProfileName;
                 session.PlayerProfileMatchMethod = response.PlayerProfileMatchMethod;
@@ -1066,13 +1198,18 @@ public sealed class ModEntry : Mod
 
                 if (response.ConversationShouldEnd || session.TurnCount >= session.MaxTurnCount)
                 {
+                    string endReason = response.ConversationShouldEnd ? "model requested end" : "max turn count";
                     if (!string.IsNullOrWhiteSpace(response.NpcResponse))
-                        this.DisplayGeneratedDialogue(npc, response.NpcResponse, replaceOpenBox: Game1.activeClickableMenu is DialogueBox);
-                    this.EndBranchingConversation(response.ConversationShouldEnd ? "model requested end" : "max turn count");
+                        this.ShowBranchingNpcTyping(session, npc, response.NpcResponse, Array.Empty<PlayerDialogueOption>(), endReason);
+                    else
+                        this.EndBranchingConversation(endReason);
                     return;
                 }
 
-                this.ShowBranchingOptions(session, npc, response.NpcResponse, response.PlayerOptions);
+                if (string.IsNullOrWhiteSpace(response.NpcResponse))
+                    this.ShowBranchingOptions(session, npc, response.NpcResponse, response.PlayerOptions);
+                else
+                    this.ShowBranchingNpcTyping(session, npc, response.NpcResponse, response.PlayerOptions, endReason: null);
             });
         });
     }
@@ -1083,7 +1220,13 @@ public sealed class ModEntry : Mod
         string npcResponse,
         IReadOnlyList<PlayerDialogueOption> options)
     {
-        if (Game1.activeClickableMenu is DialogueBox)
+        this.ApplyBranchingConversationLock("show options");
+        this.branchingAwaitingResponse = false;
+        this.branchingUiState = BranchingUiState.ShowingPlayerOptions;
+        this.pendingBranchingOptions = Array.Empty<PlayerDialogueOption>();
+        this.pendingBranchingNpcResponse = "";
+        this.pendingBranchingEndReason = null;
+        if (Game1.activeClickableMenu is not null)
             Game1.exitActiveMenu();
 
         this.activeBranchingOptions = options.ToArray();
@@ -1095,11 +1238,124 @@ public sealed class ModEntry : Mod
             ? $"Talk to {session.NpcDisplayName}:"
             : npcResponse.Trim();
 
+        this.activeBranchingPrompt = prompt;
         Game1.currentLocation.createQuestionDialogue(prompt, responses, this.OnBranchingOptionSelected);
         Game1.currentSpeaker = npc;
         this.suppressActionUntil = DateTime.UtcNow.AddMilliseconds(PostDisplaySuppressionMs);
         this.suppressionWindowActive = true;
         this.Monitor.Log($"[Branching] Displayed options session={session.SessionId}, npc={session.NpcName}, prompt={Preview(prompt)}, options={options.Count}.", LogLevel.Info);
+    }
+
+    private void ShowBranchingNpcTyping(
+        BranchingDialogueSession session,
+        NPC npc,
+        string npcResponse,
+        IReadOnlyList<PlayerDialogueOption> nextOptions,
+        string? endReason)
+    {
+        if (!Context.IsWorldReady || this.activeBranchingSession != session || !session.IsActive)
+            return;
+
+        this.ApplyBranchingConversationLock("npc typing response");
+        this.branchingAwaitingResponse = false;
+        this.branchingUiState = BranchingUiState.TypingNpcResponse;
+        this.pendingBranchingNpcResponse = npcResponse.Trim();
+        this.pendingBranchingOptions = nextOptions.ToArray();
+        this.pendingBranchingEndReason = endReason;
+        this.branchingTypingStartedAt = DateTime.UtcNow;
+
+        if (Game1.activeClickableMenu is not null)
+            Game1.exitActiveMenu();
+
+        try
+        {
+            StardewValley.Dialogue dialogue = new(npc, null, this.pendingBranchingNpcResponse);
+            npc.CurrentDialogue.Clear();
+            npc.CurrentDialogue.Push(dialogue);
+            Game1.currentSpeaker = npc;
+            Game1.drawDialogue(npc);
+            this.Monitor.Log($"[Branching] NPC typing started session={session.SessionId}, npc={session.NpcName}, response={Preview(this.pendingBranchingNpcResponse)}, nextOptions={this.pendingBranchingOptions.Count}, endReason={endReason ?? "(none)"}.", LogLevel.Info);
+        }
+        catch (Exception ex)
+        {
+            this.Monitor.Log($"[Branching] NPC typing display failed ({ex.Message}); showing options immediately.", LogLevel.Warn);
+            if (!string.IsNullOrWhiteSpace(endReason))
+                this.EndBranchingConversation(endReason);
+            else
+                this.ShowBranchingOptions(session, npc, this.pendingBranchingNpcResponse, this.pendingBranchingOptions);
+        }
+    }
+
+    private void UpdateBranchingTypingState()
+    {
+        if (this.branchingUiState != BranchingUiState.TypingNpcResponse)
+            return;
+
+        BranchingDialogueSession? session = this.activeBranchingSession;
+        NPC? npc = this.activeBranchingNpc;
+        if (session is null || npc is null || !session.IsActive)
+            return;
+
+        if (!this.IsBranchingNpcTypingComplete())
+            return;
+
+        this.Monitor.Log($"[Branching] NPC typing complete session={session.SessionId}, npc={session.NpcName}, nextOptions={this.pendingBranchingOptions.Count}, endReason={this.pendingBranchingEndReason ?? "(none)"}.", LogLevel.Info);
+        string? endReason = this.pendingBranchingEndReason;
+        IReadOnlyList<PlayerDialogueOption> nextOptions = this.pendingBranchingOptions;
+        string prompt = this.pendingBranchingNpcResponse;
+
+        this.pendingBranchingEndReason = null;
+        this.pendingBranchingOptions = Array.Empty<PlayerDialogueOption>();
+        this.pendingBranchingNpcResponse = "";
+
+        if (!string.IsNullOrWhiteSpace(endReason))
+        {
+            this.EndBranchingConversation(endReason);
+            return;
+        }
+
+        this.ShowBranchingOptions(session, npc, prompt, nextOptions);
+    }
+
+    private bool IsBranchingNpcTypingComplete()
+    {
+        if (Game1.activeClickableMenu is not DialogueBox)
+            return (DateTime.UtcNow - this.branchingTypingStartedAt).TotalMilliseconds > 250;
+
+        string current = GetCurrentDialogueText();
+        if (string.IsNullOrWhiteSpace(current))
+            return false;
+
+        string expected = NormalizeDialogueForCompletion(this.pendingBranchingNpcResponse);
+        string shown = NormalizeDialogueForCompletion(current);
+        return shown.Length >= expected.Length;
+    }
+
+    private void EnterBranchingWaitingState(BranchingDialogueSession session, NPC npc, string reason)
+    {
+        if (!Context.IsWorldReady || this.activeBranchingSession != session || !session.IsActive)
+            return;
+
+        this.ApplyBranchingConversationLock("waiting for response");
+        this.branchingAwaitingResponse = true;
+        this.branchingUiState = BranchingUiState.WaitingForApiResponse;
+        Game1.currentSpeaker = npc;
+
+        if (Game1.activeClickableMenu is null && this.activeBranchingOptions.Count > 0)
+        {
+            Response[] responses = this.activeBranchingOptions
+                .Select(option => new Response(option.Id, option.Text))
+                .ToArray();
+            string prompt = string.IsNullOrWhiteSpace(this.activeBranchingPrompt)
+                ? $"Talk to {session.NpcDisplayName}:"
+                : this.activeBranchingPrompt;
+            Game1.currentLocation.createQuestionDialogue(prompt, responses, this.OnBranchingOptionSelected);
+            Game1.currentSpeaker = npc;
+        }
+
+        this.Monitor.Log(
+            $"[Branching] Waiting for API response session={session.SessionId}, npc={session.NpcName}, reason={reason}, keeping current menu={Game1.activeClickableMenu?.GetType().Name ?? "(none)"} visible.",
+            LogLevel.Info);
     }
 
     private void OnBranchingOptionSelected(Farmer who, string answer)
@@ -1108,6 +1364,12 @@ public sealed class ModEntry : Mod
         NPC? npc = this.activeBranchingNpc;
         if (session is null || npc is null || !session.IsActive)
             return;
+
+        if (this.branchingAwaitingResponse || this.branchingUiState is BranchingUiState.WaitingForApiResponse or BranchingUiState.TypingNpcResponse)
+        {
+            this.Monitor.Log($"[Branching] Ignored option selection while awaiting API response session={session.SessionId}, answer={answer}.", LogLevel.Trace);
+            return;
+        }
 
         PlayerDialogueOption? selected = this.activeBranchingOptions.FirstOrDefault(option => option.Id == answer)
             ?? this.activeBranchingOptions.FirstOrDefault(option => option.Text == answer);
@@ -1127,11 +1389,16 @@ public sealed class ModEntry : Mod
         }
 
         string mode = selected.IsNpcInitiates ? "npc_initiates" : "turn";
+        this.branchingUiState = BranchingUiState.WaitingForApiResponse;
         this.RequestBranchingAsync(session, npc, mode, selected, this.pendingRequestId);
     }
 
     private void EndBranchingConversation(string reason)
     {
+        if (this.branchingCleanupInProgress)
+            return;
+
+        this.branchingCleanupInProgress = true;
         BranchingDialogueSession? session = this.activeBranchingSession;
         if (session is not null)
         {
@@ -1140,12 +1407,34 @@ public sealed class ModEntry : Mod
             this.Monitor.Log($"[Branching] Conversation end session={session.SessionId}, npc={session.NpcName}, reason={reason}, turns={session.TurnCount}.", LogLevel.Info);
         }
 
+        this.Monitor.Log($"[Branching] Cleanup begin reason={reason}; before={this.DescribeBranchingGameState()}.", LogLevel.Info);
+
         this.activeBranchingSession = null;
         this.activeBranchingNpc = null;
         this.activeBranchingOptions = Array.Empty<PlayerDialogueOption>();
+        this.activeBranchingPrompt = "";
+        this.pendingBranchingOptions = Array.Empty<PlayerDialogueOption>();
+        this.pendingBranchingNpcResponse = "";
+        this.pendingBranchingEndReason = null;
+        this.branchingUiState = BranchingUiState.ConversationEnded;
+        this.branchingConversationLockActive = false;
+        this.branchingAwaitingResponse = false;
+        this.suppressionWindowActive = false;
+        this.suppressActionUntil = DateTime.MinValue;
 
-        if (Game1.activeClickableMenu is DialogueBox)
-            Game1.exitActiveMenu();
+        try
+        {
+            if (Game1.activeClickableMenu is not null)
+                Game1.exitActiveMenu();
+        }
+        catch (Exception ex)
+        {
+            this.Monitor.Log($"[Branching] Cleanup menu close failed: {ex.Message}", LogLevel.Warn);
+        }
+
+        this.ReleaseBranchingConversationLock(reason);
+        this.Monitor.Log($"[Branching] Cleanup complete reason={reason}; after={this.DescribeBranchingGameState()}.", LogLevel.Info);
+        this.branchingCleanupInProgress = false;
     }
 
     private static BranchingDialogueResponse CreateFallbackBranchingResponse(string mode)
@@ -1157,6 +1446,8 @@ public sealed class ModEntry : Mod
                 PlayerOptions = new[]
                 {
                     new PlayerDialogueOption { Id = "fallback_open", Text = "Hi. How are you doing?", Action = "choose" },
+                    new PlayerDialogueOption { Id = "fallback_open_town", Text = "How have things been around town?", Action = "choose" },
+                    new PlayerDialogueOption { Id = "fallback_open_chat", Text = "Got a minute to talk?", Action = "choose" },
                     new PlayerDialogueOption { Id = "let_them_speak_first", Text = "Let them speak first.", Action = "npc_initiates" },
                     new PlayerDialogueOption { Id = "exit", Text = "Never mind.", Action = "exit", EndsConversation = true }
                 },
@@ -1166,14 +1457,215 @@ public sealed class ModEntry : Mod
 
         return new BranchingDialogueResponse
         {
-            NpcResponse = "Sorry, I lost my train of thought for a moment.",
+            NpcResponse = "Let's talk about something simple for now.",
             PlayerOptions = new[]
             {
                 new PlayerDialogueOption { Id = "fallback_continue", Text = "That's okay.", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_more", Text = "Tell me more.", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_day", Text = "How has your day been otherwise?", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_farm", Text = "I've been keeping busy on the farm.", Action = "choose" },
                 new PlayerDialogueOption { Id = "fallback_end", Text = "I should get going.", Action = "exit", EndsConversation = true }
             },
             Error = "Fallback branching response used."
         };
+    }
+
+    private static void EnsureFiveBranchingOptions(BranchingDialogueResponse response, string mode)
+    {
+        bool opening = mode.Equals("opening_options", StringComparison.OrdinalIgnoreCase);
+        List<PlayerDialogueOption> options = response.PlayerOptions
+            .Where(option => !string.IsNullOrWhiteSpace(option.Text))
+            .ToList();
+
+        PlayerDialogueOption? exit = options.FirstOrDefault(option => option.IsExit);
+        if (exit is null)
+            exit = new PlayerDialogueOption { Id = opening ? "exit" : "end_conversation", Text = opening ? "Never mind." : "I should get going.", Action = "exit", EndsConversation = true };
+
+        PlayerDialogueOption? speakFirst = opening
+            ? options.FirstOrDefault(option => option.IsNpcInitiates)
+            : null;
+        if (opening && speakFirst is null)
+            speakFirst = new PlayerDialogueOption { Id = "let_them_speak_first", Text = "Let them speak first.", Action = "npc_initiates" };
+
+        List<PlayerDialogueOption> normal = options
+            .Where(option => !option.IsExit && !option.IsNpcInitiates)
+            .Take(opening ? 3 : 4)
+            .ToList();
+
+        string[] fallbackTexts = opening
+            ? new[] { "Hi. How are you doing?", "How have things been around town?", "Got a minute to talk?" }
+            : new[] { "That's okay.", "Tell me more.", "How has your day been otherwise?", "I've been keeping busy on the farm." };
+
+        int index = 0;
+        while (normal.Count < (opening ? 3 : 4) && index < fallbackTexts.Length)
+        {
+            string text = fallbackTexts[index++];
+            if (normal.Any(option => option.Text.Equals(text, StringComparison.OrdinalIgnoreCase)))
+                continue;
+            normal.Add(new PlayerDialogueOption { Id = $"fallback_option_{index}", Text = text, Action = "choose" });
+        }
+
+        response.PlayerOptions = opening
+            ? normal.Concat(new[] { speakFirst!, exit }).Take(5).ToArray()
+            : normal.Concat(new[] { exit }).Take(5).ToArray();
+    }
+
+    private void AcquireBranchingConversationLock(BranchingDialogueSession session, NPC npc, string reason)
+    {
+        this.branchingConversationLockActive = true;
+        Game1.currentSpeaker = npc;
+        this.ApplyBranchingConversationLock(reason);
+        this.Monitor.Log($"[Branching] Lock acquired session={session.SessionId}, reason={reason}; state={this.DescribeBranchingGameState()}.", LogLevel.Info);
+    }
+
+    private void ApplyBranchingConversationLock(string reason)
+    {
+        if (!this.branchingConversationLockActive || !Context.IsWorldReady)
+            return;
+
+        TrySetStaticBool(typeof(Game1), "freezeControls", true);
+        TrySetPlayerBool("CanMove", false);
+        TrySetPlayerBool("canMove", false);
+
+        if (this.config.DebugLogging)
+            this.Monitor.Log($"[Branching] Lock maintained reason={reason}; state={this.DescribeBranchingGameState()}.", LogLevel.Trace);
+    }
+
+    private void ReleaseBranchingConversationLock(string reason)
+    {
+        TrySetStaticBool(typeof(Game1), "freezeControls", false);
+        TrySetStaticBool(typeof(Game1), "dialogueUp", false);
+        TrySetStaticBool(typeof(Game1), "eventUp", false);
+        TrySetPlayerBool("CanMove", true);
+        TrySetPlayerBool("canMove", true);
+
+        try
+        {
+            Game1.currentSpeaker = null;
+        }
+        catch
+        {
+            // Best-effort cleanup; currentSpeaker is diagnostic/UI state, not worth failing cleanup.
+        }
+
+        this.Monitor.Log($"[Branching] Lock released reason={reason}; state={this.DescribeBranchingGameState()}.", LogLevel.Info);
+    }
+
+    private string DescribeBranchingGameState()
+    {
+        string menu = Game1.activeClickableMenu?.GetType().Name ?? "(none)";
+        string speaker = Game1.currentSpeaker?.Name ?? "(none)";
+        string freezeControls = TryGetStaticBool(typeof(Game1), "freezeControls")?.ToString() ?? "(unknown)";
+        string dialogueUp = TryGetStaticBool(typeof(Game1), "dialogueUp")?.ToString() ?? "(unknown)";
+        string eventUp = TryGetStaticBool(typeof(Game1), "eventUp")?.ToString() ?? "(unknown)";
+        string canMove = TryGetPlayerBool("CanMove")?.ToString()
+            ?? TryGetPlayerBool("canMove")?.ToString()
+            ?? "(unknown)";
+        return $"menu={menu}, speaker={speaker}, freezeControls={freezeControls}, dialogueUp={dialogueUp}, eventUp={eventUp}, playerCanMove={canMove}, lockActive={this.branchingConversationLockActive}, awaitingResponse={this.branchingAwaitingResponse}";
+    }
+
+    private static string FormatRecentBranchingHistory(BranchingDialogueSession session)
+    {
+        return string.Join(" | ", session.Turns.TakeLast(3).Select(turn =>
+            $"P: {turn.PlayerChoiceText} / NPC: {turn.NpcResponse}"));
+    }
+
+    private static bool? TryGetStaticBool(Type type, string name)
+    {
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Static;
+
+        try
+        {
+            System.Reflection.FieldInfo? field = type.GetField(name, flags);
+            if (field?.FieldType == typeof(bool))
+                return (bool)field.GetValue(null)!;
+
+            System.Reflection.PropertyInfo? property = type.GetProperty(name, flags);
+            if (property?.PropertyType == typeof(bool) && property.GetMethod is not null)
+                return (bool)property.GetValue(null)!;
+        }
+        catch { }
+
+        return null;
+    }
+
+    private static void TrySetStaticBool(Type type, string name, bool value)
+    {
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Static;
+
+        try
+        {
+            System.Reflection.FieldInfo? field = type.GetField(name, flags);
+            if (field?.FieldType == typeof(bool))
+            {
+                field.SetValue(null, value);
+                return;
+            }
+
+            System.Reflection.PropertyInfo? property = type.GetProperty(name, flags);
+            if (property?.PropertyType == typeof(bool) && property.SetMethod is not null)
+                property.SetValue(null, value);
+        }
+        catch { }
+    }
+
+    private static bool? TryGetPlayerBool(string name)
+    {
+        Farmer? player = Game1.player;
+        if (player is null)
+            return null;
+
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Instance;
+
+        try
+        {
+            System.Reflection.PropertyInfo? property = player.GetType().GetProperty(name, flags);
+            if (property?.PropertyType == typeof(bool) && property.GetMethod is not null)
+                return (bool)property.GetValue(player)!;
+
+            System.Reflection.FieldInfo? field = player.GetType().GetField(name, flags);
+            if (field?.FieldType == typeof(bool))
+                return (bool)field.GetValue(player)!;
+        }
+        catch { }
+
+        return null;
+    }
+
+    private static void TrySetPlayerBool(string name, bool value)
+    {
+        Farmer? player = Game1.player;
+        if (player is null)
+            return;
+
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Instance;
+
+        try
+        {
+            System.Reflection.PropertyInfo? property = player.GetType().GetProperty(name, flags);
+            if (property?.PropertyType == typeof(bool) && property.SetMethod is not null)
+            {
+                property.SetValue(player, value);
+                return;
+            }
+
+            System.Reflection.FieldInfo? field = player.GetType().GetField(name, flags);
+            if (field?.FieldType == typeof(bool))
+                field.SetValue(player, value);
+        }
+        catch { }
     }
 
     private void RequestGeneratedForHarmony(NPC npc, long requestId)
@@ -1716,6 +2208,16 @@ public sealed class ModEntry : Mod
             // Non-fatal: this is only used for diagnostic logging.
         }
         return "";
+    }
+
+    private static string NormalizeDialogueForCompletion(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return "";
+
+        return new string(text
+            .Where(c => !char.IsControl(c) && !char.IsWhiteSpace(c))
+            .ToArray());
     }
 
     private bool RecentlyHandled(string npcName)

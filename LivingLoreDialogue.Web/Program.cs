@@ -1065,12 +1065,20 @@ static async Task<IResult> GenerateBranchingDialogue(
             request.SaveContext.Day);
 
     logger.LogInformation(
-        "[Branching] Request mode={Mode}, npc={Npc}, turn={Turn}/{MaxTurn}, history={HistoryCount}.",
+        "[Branching] Request session={SessionId}, mode={Mode}, npc={Npc}, turn={Turn}/{MaxTurn}, history={HistoryCount}.",
+        string.IsNullOrWhiteSpace(request.SessionId) ? "(none)" : request.SessionId,
         request.Mode,
         request.Context.CharacterName,
         request.TurnCount,
         request.MaxTurnCount,
         request.History.Count);
+    logger.LogInformation(
+        "[Branching] Selected option id={SelectedId}, text={SelectedText}. Latest player={LatestPlayer}. Latest npc={LatestNpc}. Recent history={RecentHistory}.",
+        string.IsNullOrWhiteSpace(request.SelectedOptionId) ? "(none)" : request.SelectedOptionId,
+        string.IsNullOrWhiteSpace(request.SelectedOptionText) ? "(none)" : request.SelectedOptionText,
+        request.History.LastOrDefault()?.PlayerChoiceText ?? "(none)",
+        request.History.LastOrDefault()?.NpcResponse ?? "(none)",
+        string.Join(" | ", request.History.TakeLast(3).Select(turn => $"P: {turn.PlayerChoiceText} / NPC: {turn.NpcResponse}")));
 
     try
     {
@@ -1085,6 +1093,10 @@ static async Task<IResult> GenerateBranchingDialogue(
             response.PlayerOptions.Count,
             response.ConversationShouldEnd,
             response.Error);
+        logger.LogInformation(
+            "[Branching] Prompt/template used: {Template}. Prompt includes selected option={IncludesSelected}.",
+            response.PromptUsed.Contains("BRANCHING_DIALOGUE_CONVERSATION_V3", StringComparison.Ordinal) ? "BRANCHING_DIALOGUE_CONVERSATION_V3" : "(unknown)",
+            !string.IsNullOrWhiteSpace(request.SelectedOptionText) && response.PromptUsed.Contains(request.SelectedOptionText, StringComparison.Ordinal));
 
         if (!profileResolved)
             logger.LogInformation("[Branching] No custom player profile resolved; default Stardew farmer profile was injected into the prompt.");
@@ -1096,10 +1108,13 @@ static async Task<IResult> GenerateBranchingDialogue(
         logger.LogError(ex, "[Branching] Endpoint failed for npc={Npc}.", request.Context.CharacterName);
         return Results.Ok(new BranchingDialogueResponse
         {
-            NpcResponse = "Sorry, I lost my train of thought for a moment.",
+            NpcResponse = "Let's talk about something simple for now.",
             PlayerOptions = new[]
             {
                 new PlayerDialogueOption { Id = "fallback_continue", Text = "That's okay.", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_more", Text = "Tell me more.", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_day", Text = "How has your day been otherwise?", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_farm", Text = "I've been keeping busy on the farm.", Action = "choose" },
                 new PlayerDialogueOption { Id = "fallback_end", Text = "I should get going.", Action = "exit", EndsConversation = true }
             },
             Error = ex.Message,

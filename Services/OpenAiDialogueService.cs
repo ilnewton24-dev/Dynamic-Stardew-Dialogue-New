@@ -138,8 +138,8 @@ public sealed class OpenAiDialogueService
                             playerOptions = new
                             {
                                 type = "array",
-                                minItems = 2,
-                                maxItems = 7,
+                                minItems = 5,
+                                maxItems = 5,
                                 items = new
                                 {
                                     type = "object",

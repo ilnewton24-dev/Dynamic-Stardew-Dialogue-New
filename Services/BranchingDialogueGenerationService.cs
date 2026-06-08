@@ -6,6 +6,7 @@ namespace LivingLoreDialogue.Services;
 public sealed class BranchingDialogueGenerationService
 {
     private const string DefaultFarmerProfile = "Default Stardew Valley farmer: inherited Grandpa's farm, recently moved from the city, no special magical, military, noble, or custom background, practical and neighborly standard Stardew farmer tone.";
+    private const int TotalPlayerOptions = 5;
 
     private readonly DialogueContextBuilderService contextBuilder;
     private readonly OpenAiDialogueService openAiDialogueService;
@@ -59,7 +60,7 @@ public sealed class BranchingDialogueGenerationService
         catch (Exception ex)
         {
             result.Error = $"OpenAI branching dialogue generation failed: {ex.Message}";
-            result.NpcResponse = request.Mode.Equals("opening_options", StringComparison.OrdinalIgnoreCase) ? "" : "Sorry, I lost my train of thought for a moment.";
+            result.NpcResponse = request.Mode.Equals("opening_options", StringComparison.OrdinalIgnoreCase) ? "" : "Let's talk about something simple for now.";
             result.PlayerOptions = FallbackOptions(request.Mode);
             return result;
         }
@@ -73,7 +74,10 @@ public sealed class BranchingDialogueGenerationService
         bool openingOnly = IsOpeningOptions(request.Mode);
         bool npcInitiates = request.Mode.Equals("npc_initiates", StringComparison.OrdinalIgnoreCase);
 
+        builder.AppendLine("Prompt template: BRANCHING_DIALOGUE_CONVERSATION_V3.");
         builder.AppendLine("You write interactive branching dialogue for a Stardew Valley SMAPI mod.");
+        if (!openingOnly)
+            builder.AppendLine("You are continuing an existing conversation. Do not restart, summarize, or switch to a generic standalone NPC line.");
         builder.AppendLine("Return only JSON matching the provided schema.");
         builder.AppendLine("Style rules:");
         builder.AppendLine("- Keep Stardew-style dialogue concise, warm, character-specific, and dialogue-box friendly.");
@@ -127,15 +131,39 @@ public sealed class BranchingDialogueGenerationService
             AppendField(builder, "Relationship patterns", lore.DialogueSummary.RelationshipPatterns);
         }
 
-        AppendList(builder, "Conversation history", request.History.Select((turn, index) => $"{index + 1}. Player: {turn.PlayerChoiceText} / {lore.Character.Name}: {turn.NpcResponse}"));
+        builder.AppendLine();
+        builder.AppendLine("Conversation history:");
+        if (request.History.Count == 0)
+        {
+            builder.AppendLine("(No prior turns yet.)");
+        }
+        else
+        {
+            foreach (var item in request.History.Select((turn, index) => new { turn, index }))
+            {
+                builder.AppendLine($"{item.index + 1}. Player: {item.turn.PlayerChoiceText}");
+                builder.AppendLine($"{item.index + 1}. {lore.Character.Name}: {item.turn.NpcResponse}");
+            }
+        }
+
         if (!string.IsNullOrWhiteSpace(request.SelectedOptionText))
-            builder.AppendLine($"Selected player choice this turn: {request.SelectedOptionText}");
+        {
+            builder.AppendLine();
+            builder.AppendLine("CURRENT PLAYER LINE:");
+            builder.AppendLine("The player's most recent selected response is:");
+            builder.AppendLine($"\"{request.SelectedOptionText}\"");
+            builder.AppendLine("Generate the NPC's direct response to that specific player statement.");
+            builder.AppendLine("Do not start a new topic unless it naturally follows from the conversation.");
+            builder.AppendLine("Do not ignore the player's selected response.");
+            builder.AppendLine("Maintain continuity with previous turns.");
+            builder.AppendLine("Then generate the next player response options based on the NPC's latest response, the active conversation topic, and the player profile.");
+        }
 
         builder.AppendLine();
         if (openingOnly)
         {
             builder.AppendLine("Generate opening player options before the NPC speaks.");
-            builder.AppendLine("Return playerOptions only: 3 to 5 in-character opening choices, plus let_them_speak_first with action npc_initiates, plus exit with action exit.");
+            builder.AppendLine("Return exactly 5 total playerOptions: 3 in-character opening choices, 1 let_them_speak_first option with action npc_initiates, and 1 exit option with action exit.");
         }
         else if (npcInitiates)
         {
@@ -143,10 +171,12 @@ public sealed class BranchingDialogueGenerationService
         }
         else
         {
-            builder.AppendLine("Generate the NPC response to the selected player choice and the next player options.");
+            builder.AppendLine("Generate the NPC response to the selected player choice and the next player options. Do not write a generic standalone NPC line.");
+            builder.AppendLine("The first sentence should clearly connect to the player's most recent selected response or the immediately previous NPC response.");
         }
 
-        builder.AppendLine("For normal turns, return npcResponse, 3 to 5 in-character playerOptions, and one clean ending option such as \"I should get going.\".");
+        builder.AppendLine("For normal turns, return npcResponse and exactly 5 total playerOptions: 4 in-character choices and 1 clean ending option such as \"I should get going.\".");
+        builder.AppendLine("Follow-up player options must relate directly to the NPC's latest response and the active conversation topic; avoid generic options that could fit any conversation.");
         builder.AppendLine("Set conversationShouldEnd true if the selected option naturally ends the conversation or max turns have been reached.");
         return builder.ToString();
     }
@@ -155,7 +185,6 @@ public sealed class BranchingDialogueGenerationService
     {
         List<PlayerDialogueOption> options = response.PlayerOptions
             .Where(option => !string.IsNullOrWhiteSpace(option.Text))
-            .Take(7)
             .Select((option, index) => new PlayerDialogueOption
             {
                 Id = string.IsNullOrWhiteSpace(option.Id) ? $"option_{index + 1}" : option.Id,
@@ -167,15 +196,26 @@ public sealed class BranchingDialogueGenerationService
 
         if (IsOpeningOptions(request.Mode))
         {
-            if (!options.Any(option => option.Action.Equals("npc_initiates", StringComparison.OrdinalIgnoreCase)))
-                options.Add(new PlayerDialogueOption { Id = "let_them_speak_first", Text = "Let them speak first.", Action = "npc_initiates" });
-            if (!options.Any(option => option.IsExit))
-                options.Add(new PlayerDialogueOption { Id = "exit", Text = "Never mind.", Action = "exit", EndsConversation = true });
+            PlayerDialogueOption speakFirst = options.FirstOrDefault(option => option.Action.Equals("npc_initiates", StringComparison.OrdinalIgnoreCase))
+                ?? new PlayerDialogueOption { Id = "let_them_speak_first", Text = "Let them speak first.", Action = "npc_initiates" };
+            PlayerDialogueOption exit = options.FirstOrDefault(option => option.IsExit)
+                ?? new PlayerDialogueOption { Id = "exit", Text = "Never mind.", Action = "exit", EndsConversation = true };
+            options = FillNormalOptions(options.Where(option => !option.IsExit && !option.IsNpcInitiates), opening: true)
+                .Take(3)
+                .Concat(new[] { speakFirst, exit })
+                .Take(TotalPlayerOptions)
+                .ToList();
             response.NpcResponse = "";
         }
-        else if (!options.Any(option => option.IsExit))
+        else
         {
-            options.Add(new PlayerDialogueOption { Id = "end_conversation", Text = "I should get going.", Action = "exit", EndsConversation = true });
+            PlayerDialogueOption exit = options.FirstOrDefault(option => option.IsExit)
+                ?? new PlayerDialogueOption { Id = "end_conversation", Text = "I should get going.", Action = "exit", EndsConversation = true };
+            options = FillNormalOptions(options.Where(option => !option.IsExit && !option.IsNpcInitiates), opening: false)
+                .Take(4)
+                .Concat(new[] { exit })
+                .Take(TotalPlayerOptions)
+                .ToList();
         }
 
         if (request.TurnCount >= request.MaxTurnCount)
@@ -191,6 +231,8 @@ public sealed class BranchingDialogueGenerationService
             return new[]
             {
                 new PlayerDialogueOption { Id = "fallback_open", Text = "Hi. How are you doing?", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_open_farm", Text = "I wanted to ask how things have been around town.", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_open_check_in", Text = "Got a minute to talk?", Action = "choose" },
                 new PlayerDialogueOption { Id = "let_them_speak_first", Text = "Let them speak first.", Action = "npc_initiates" },
                 new PlayerDialogueOption { Id = "exit", Text = "Never mind.", Action = "exit", EndsConversation = true }
             };
@@ -199,11 +241,45 @@ public sealed class BranchingDialogueGenerationService
         return new[]
         {
             new PlayerDialogueOption { Id = "fallback_continue", Text = "Tell me more.", Action = "choose" },
+            new PlayerDialogueOption { Id = "fallback_kind", Text = "That sounds important.", Action = "choose" },
+            new PlayerDialogueOption { Id = "fallback_casual", Text = "How has your day been otherwise?", Action = "choose" },
+            new PlayerDialogueOption { Id = "fallback_player", Text = "I've been keeping busy on the farm.", Action = "choose" },
             new PlayerDialogueOption { Id = "fallback_end", Text = "I should get going.", Action = "exit", EndsConversation = true }
         };
     }
 
     private static bool IsOpeningOptions(string mode) => mode.Equals("opening_options", StringComparison.OrdinalIgnoreCase);
+
+    private static IEnumerable<PlayerDialogueOption> FillNormalOptions(IEnumerable<PlayerDialogueOption> options, bool opening)
+    {
+        List<PlayerDialogueOption> filled = options.ToList();
+        string prefix = opening ? "opening" : "turn";
+        string[] fallbackTexts = opening
+            ? new[]
+            {
+                "Hi. How are you doing?",
+                "I wanted to ask how things have been around town.",
+                "Got a minute to talk?"
+            }
+            : new[]
+            {
+                "Tell me more.",
+                "That sounds important.",
+                "How has your day been otherwise?",
+                "I've been keeping busy on the farm."
+            };
+
+        int index = 0;
+        while (filled.Count < (opening ? 3 : 4) && index < fallbackTexts.Length)
+        {
+            string text = fallbackTexts[index++];
+            if (filled.Any(option => option.Text.Equals(text, StringComparison.OrdinalIgnoreCase)))
+                continue;
+            filled.Add(new PlayerDialogueOption { Id = $"fallback_{prefix}_{index}", Text = text, Action = "choose" });
+        }
+
+        return filled;
+    }
 
     private static void AppendField(StringBuilder builder, string label, string? value)
     {

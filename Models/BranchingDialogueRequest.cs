@@ -2,6 +2,7 @@ namespace LivingLoreDialogue.Models;
 
 public sealed class BranchingDialogueRequest
 {
+    public string SessionId { get; set; } = "";
     public DialogueContext Context { get; set; } = new();
     public SaveFileContextSnapshot? SaveContext { get; set; }
     public long? PlayerProfileId { get; set; }
