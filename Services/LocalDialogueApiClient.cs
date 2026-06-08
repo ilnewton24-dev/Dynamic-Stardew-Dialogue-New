@@ -12,6 +12,7 @@ namespace LivingLoreDialogue.Services;
 public sealed class LocalDialogueApiClient
 {
     private const string Endpoint = "/api/dialogue/generate";
+    private const string BranchingEndpoint = "/api/dialogue/branching";
 
     private static readonly JsonSerializerOptions ReadOptions = new() { PropertyNameCaseInsensitive = true };
 
@@ -94,6 +95,48 @@ public sealed class LocalDialogueApiClient
         catch (Exception ex)
         {
             this.logError?.Invoke($"[Server request] Exception calling server: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+    }
+
+    public async Task<BranchingDialogueResponse?> GenerateBranchingAsync(BranchingDialogueRequest request, string requestSource = "SMAPI-Branching")
+    {
+        if (string.IsNullOrWhiteSpace(request.Context.RequestSource))
+            request.Context.RequestSource = requestSource;
+
+        string baseUrl = this.httpClient.BaseAddress?.ToString().TrimEnd('/') ?? "(no base url)";
+        string requestJson = JsonSerializer.Serialize(request);
+        this.logInfo?.Invoke($"[Branching request] About to call {baseUrl}{BranchingEndpoint} (mode={request.Mode}, source={request.Context.RequestSource}).");
+        this.logInfo?.Invoke($"[Branching request] Payload: {Preview(requestJson)}");
+
+        try
+        {
+            using HttpResponseMessage response = await this.httpClient.PostAsJsonAsync(BranchingEndpoint, request);
+            string body = await response.Content.ReadAsStringAsync();
+            this.logInfo?.Invoke($"[Branching response] Status {(int)response.StatusCode} {response.ReasonPhrase}.");
+            this.logInfo?.Invoke($"[Branching response] Body: {Preview(body)}");
+
+            if (!response.IsSuccessStatusCode)
+            {
+                this.logError?.Invoke($"[Branching response] Non-success status {(int)response.StatusCode}; using fallback options.");
+                return null;
+            }
+
+            BranchingDialogueResponse? result = JsonSerializer.Deserialize<BranchingDialogueResponse>(body, ReadOptions);
+            if (result is null || result.PlayerOptions.Count == 0)
+            {
+                this.logError?.Invoke("[Branching response] Response body was empty or malformed; using fallback options.");
+                return null;
+            }
+
+            if (!string.IsNullOrWhiteSpace(result.Error))
+                this.logError?.Invoke($"[Branching response] Server reported error: {result.Error}");
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            this.logError?.Invoke($"[Branching request] Exception calling server: {ex.GetType().Name}: {ex.Message}");
             return null;
         }
     }

@@ -9,6 +9,8 @@
   "ModsFolderPath": "",
   "EnableLiveInGameDialogueGeneration": true,
   "OverrideNpcDialogue": true,
+  "EnableBranchingDialogue": true,
+  "BranchingDialogueMaxTurns": 10,
   "UseHarmonyDialogueInterception": true,
   "UseLocalWebApiForDialogue": true,
   "LocalWebApiBaseUrl": "http://localhost:5077",

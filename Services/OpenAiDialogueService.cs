@@ -114,6 +114,74 @@ public sealed class OpenAiDialogueService
         return dialogue;
     }
 
+    public async Task<BranchingDialogueResponse> GenerateBranchingDialogueFromPromptAsync(string prompt, bool openingOptionsOnly)
+    {
+        object requestBody = new
+        {
+            model = this.model,
+            input = prompt,
+            max_output_tokens = openingOptionsOnly ? 520 : 760,
+            text = new
+            {
+                format = new
+                {
+                    type = "json_schema",
+                    name = openingOptionsOnly ? "living_lore_branching_opening" : "living_lore_branching_turn",
+                    strict = true,
+                    schema = new
+                    {
+                        type = "object",
+                        additionalProperties = false,
+                        properties = new
+                        {
+                            npcResponse = new { type = "string" },
+                            playerOptions = new
+                            {
+                                type = "array",
+                                minItems = 2,
+                                maxItems = 7,
+                                items = new
+                                {
+                                    type = "object",
+                                    additionalProperties = false,
+                                    properties = new
+                                    {
+                                        id = new { type = "string" },
+                                        text = new { type = "string" },
+                                        endsConversation = new { type = "boolean" },
+                                        action = new
+                                        {
+                                            type = "string",
+                                            @enum = new[] { "choose", "npc_initiates", "exit" }
+                                        }
+                                    },
+                                    required = new[] { "id", "text", "endsConversation", "action" }
+                                }
+                            },
+                            conversationShouldEnd = new { type = "boolean" }
+                        },
+                        required = new[] { "npcResponse", "playerOptions", "conversationShouldEnd" }
+                    }
+                }
+            }
+        };
+
+        using HttpRequestMessage request = new(HttpMethod.Post, "https://api.openai.com/v1/responses");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", this.apiKey);
+        request.Content = new StringContent(JsonSerializer.Serialize(requestBody, JsonOptions), Encoding.UTF8, "application/json");
+
+        using HttpResponseMessage response = await this.httpClient.SendAsync(request);
+        string responseJson = await response.Content.ReadAsStringAsync();
+        response.EnsureSuccessStatusCode();
+
+        string outputText = ExtractOutputText(responseJson);
+        BranchingDialogueResponse? branching = JsonSerializer.Deserialize<BranchingDialogueResponse>(outputText, JsonOptions);
+        if (branching is null || branching.PlayerOptions.Count == 0)
+            throw new InvalidOperationException("OpenAI returned an empty branching dialogue payload.");
+
+        return branching;
+    }
+
     public async Task<PlayerProfileAutocompleteResult> GeneratePlayerProfileAsync(string concept, CancellationToken cancellationToken = default)
     {
         if (!this.HasApiKey)

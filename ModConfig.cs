@@ -19,6 +19,12 @@ public sealed class ModConfig
     /// <summary>When true, talking to an NPC suppresses the vanilla line and shows generated dialogue instead.</summary>
     public bool OverrideNpcDialogue { get; set; } = true;
 
+    /// <summary>When true, NPC talk opens an interactive branching conversation instead of one generated line.</summary>
+    public bool EnableBranchingDialogue { get; set; } = true;
+
+    /// <summary>Maximum player/NPC back-and-forth turns for one branching conversation.</summary>
+    public int BranchingDialogueMaxTurns { get; set; } = 10;
+
     /// <summary>
     /// When true, intercept NPC.checkAction via Harmony so generated dialogue replaces vanilla
     /// before it opens (no vanilla flash). When false, fall back to the MenuChanged replacement.

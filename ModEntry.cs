@@ -24,6 +24,9 @@ public sealed class ModEntry : Mod
     private CharacterRepository? characterRepository;
     private MemoryRepository? memoryRepository;
     private PlayerProfileRepository? playerProfileRepository;
+    private BranchingDialogueSession? activeBranchingSession;
+    private NPC? activeBranchingNpc;
+    private IReadOnlyList<PlayerDialogueOption> activeBranchingOptions = Array.Empty<PlayerDialogueOption>();
 
     // Names that are locations/buildings/objects, never valid dialogue characters.
     private static readonly HashSet<string> BlockedSpeakerNames = new(StringComparer.OrdinalIgnoreCase)
@@ -84,6 +87,8 @@ public sealed class ModEntry : Mod
         this.Monitor.Log("Config loaded:", LogLevel.Info);
         this.Monitor.Log($"  EnableLiveInGameDialogueGeneration = {this.config.EnableLiveInGameDialogueGeneration}", LogLevel.Info);
         this.Monitor.Log($"  OverrideNpcDialogue (suppress vanilla, show generated) = {this.config.OverrideNpcDialogue}", LogLevel.Info);
+        this.Monitor.Log($"  EnableBranchingDialogue = {this.config.EnableBranchingDialogue}", LogLevel.Info);
+        this.Monitor.Log($"  BranchingDialogueMaxTurns = {this.config.BranchingDialogueMaxTurns}", LogLevel.Info);
         this.Monitor.Log($"  UseLocalWebApiForDialogue = {this.config.UseLocalWebApiForDialogue}", LogLevel.Info);
         this.Monitor.Log($"  Server URL = {this.config.LocalWebApiBaseUrl}", LogLevel.Info);
         this.Monitor.Log($"  UseHarmonyDialogueInterception = {this.config.UseHarmonyDialogueInterception}", LogLevel.Info);
@@ -763,6 +768,13 @@ public sealed class ModEntry : Mod
     {
         try
         {
+            if (this.activeBranchingSession?.IsActive == true && (e.Button is SButton.Escape or SButton.ControllerB))
+            {
+                this.Helper.Input.Suppress(e.Button);
+                this.EndBranchingConversation("cancel button");
+                return;
+            }
+
             if (!Context.IsWorldReady || !e.Button.IsActionButton())
                 return;
 
@@ -834,7 +846,16 @@ public sealed class ModEntry : Mod
             }
             this.MarkHandled(speaker.Name);
 
-            this.RequestAndReplace(speaker);
+            if (this.config.EnableBranchingDialogue)
+            {
+                if (Game1.activeClickableMenu is DialogueBox)
+                    Game1.exitActiveMenu();
+                this.StartBranchingConversation(speaker, ++this.dialogueRequestCounter);
+            }
+            else
+            {
+                this.RequestAndReplace(speaker);
+            }
         }
         catch (Exception ex)
         {
@@ -939,9 +960,220 @@ public sealed class ModEntry : Mod
 
         result = true; // tell the game the action was handled
 
-        this.RequestGeneratedForHarmony(npc, requestId);
+        if (this.config.EnableBranchingDialogue)
+            this.StartBranchingConversation(npc, requestId);
+        else
+            this.RequestGeneratedForHarmony(npc, requestId);
 
         return false; // task 4: skip vanilla NPC.checkAction
+    }
+
+    private void StartBranchingConversation(NPC npc, long requestId)
+    {
+        if (this.localDialogueApiClient is null)
+        {
+            this.Monitor.Log("[Branching] Local web API client is not available; falling back to single-line generation.", LogLevel.Warn);
+            this.RequestGeneratedForHarmony(npc, requestId);
+            return;
+        }
+
+        DialogueContext context = this.BuildContext(npc, "branching conversation", "SMAPI-Branching");
+        SaveFileContextSnapshot save = context.SaveContext ?? this.BuildSaveContextSnapshot(npc.Name);
+        BranchingDialogueSession session = new()
+        {
+            NpcName = npc.Name,
+            NpcDisplayName = npc.displayName ?? npc.Name,
+            PlayerName = save.PlayerName,
+            SaveContext = save,
+            MaxTurnCount = Math.Max(1, this.config.BranchingDialogueMaxTurns),
+            IsActive = true
+        };
+
+        this.activeBranchingSession = session;
+        this.activeBranchingNpc = npc;
+        this.pendingRequestId = requestId;
+        this.MarkHandled(npc.Name);
+        this.Monitor.Log(
+            $"[Branching] Conversation start session={session.SessionId}, npc={session.NpcName}, player={session.PlayerName}, hearts={save.FriendshipHearts}, relationship={save.RelationshipState}, location={save.Location}.",
+            LogLevel.Info);
+
+        this.RequestBranchingAsync(session, npc, "opening_options", null, requestId);
+    }
+
+    private void RequestBranchingAsync(
+        BranchingDialogueSession session,
+        NPC npc,
+        string mode,
+        PlayerDialogueOption? selectedOption,
+        long requestId)
+    {
+        DialogueContext context = this.BuildContext(npc, "branching conversation", "SMAPI-Branching");
+        BranchingDialogueRequest request = new()
+        {
+            Context = context,
+            SaveContext = context.SaveContext,
+            Mode = mode,
+            TurnCount = session.TurnCount,
+            MaxTurnCount = session.MaxTurnCount,
+            SelectedOptionId = selectedOption?.Id ?? "",
+            SelectedOptionText = selectedOption?.Text ?? "",
+            History = session.Turns.ToArray()
+        };
+
+        if (selectedOption is not null)
+            this.Monitor.Log($"[Branching] Selected player choice session={session.SessionId}, npc={session.NpcName}, id={selectedOption.Id}, text={Preview(selectedOption.Text)}.", LogLevel.Info);
+
+        _ = Task.Run(async () =>
+        {
+            BranchingDialogueResponse? response = this.localDialogueApiClient is null
+                ? null
+                : await this.localDialogueApiClient.GenerateBranchingAsync(request, "SMAPI-Branching");
+
+            response ??= CreateFallbackBranchingResponse(mode);
+            if (!string.IsNullOrWhiteSpace(response.Error))
+                this.Monitor.Log($"[Branching] API request returned fallback/error session={session.SessionId}: {response.Error}", LogLevel.Warn);
+            else
+                this.Monitor.Log($"[Branching] API request success session={session.SessionId}, mode={mode}, options={response.PlayerOptions.Count}.", LogLevel.Info);
+
+            this.mainThreadActions.Enqueue(() =>
+            {
+                if (!Context.IsWorldReady || this.activeBranchingSession != session || requestId != this.pendingRequestId || !session.IsActive)
+                {
+                    this.Monitor.Log($"[Branching] Discarded response for inactive/superseded session={session.SessionId}.", LogLevel.Info);
+                    return;
+                }
+
+                if (response.PlayerOptions.Count == 0)
+                {
+                    this.Monitor.Log($"[Branching] Malformed response handling session={session.SessionId}: no player options.", LogLevel.Warn);
+                    response = CreateFallbackBranchingResponse(mode);
+                }
+
+                session.PlayerProfileName = response.ActivePlayerProfileName;
+                session.PlayerProfileMatchMethod = response.PlayerProfileMatchMethod;
+                session.PlayerProfileSummary = string.IsNullOrWhiteSpace(response.ActivePlayerProfileName) ? "Default Stardew farmer profile" : response.ActivePlayerProfileName;
+
+                if (selectedOption is not null && !selectedOption.IsNpcInitiates)
+                {
+                    session.Turns.Add(new BranchingDialogueTurn
+                    {
+                        PlayerChoiceId = selectedOption.Id,
+                        PlayerChoiceText = selectedOption.Text,
+                        NpcResponse = response.NpcResponse
+                    });
+                    session.TurnCount++;
+                }
+
+                if (response.ConversationShouldEnd || session.TurnCount >= session.MaxTurnCount)
+                {
+                    if (!string.IsNullOrWhiteSpace(response.NpcResponse))
+                        this.DisplayGeneratedDialogue(npc, response.NpcResponse, replaceOpenBox: Game1.activeClickableMenu is DialogueBox);
+                    this.EndBranchingConversation(response.ConversationShouldEnd ? "model requested end" : "max turn count");
+                    return;
+                }
+
+                this.ShowBranchingOptions(session, npc, response.NpcResponse, response.PlayerOptions);
+            });
+        });
+    }
+
+    private void ShowBranchingOptions(
+        BranchingDialogueSession session,
+        NPC npc,
+        string npcResponse,
+        IReadOnlyList<PlayerDialogueOption> options)
+    {
+        if (Game1.activeClickableMenu is DialogueBox)
+            Game1.exitActiveMenu();
+
+        this.activeBranchingOptions = options.ToArray();
+        Response[] responses = this.activeBranchingOptions
+            .Select(option => new Response(option.Id, option.Text))
+            .ToArray();
+
+        string prompt = string.IsNullOrWhiteSpace(npcResponse)
+            ? $"Talk to {session.NpcDisplayName}:"
+            : npcResponse.Trim();
+
+        Game1.currentLocation.createQuestionDialogue(prompt, responses, this.OnBranchingOptionSelected);
+        Game1.currentSpeaker = npc;
+        this.suppressActionUntil = DateTime.UtcNow.AddMilliseconds(PostDisplaySuppressionMs);
+        this.suppressionWindowActive = true;
+        this.Monitor.Log($"[Branching] Displayed options session={session.SessionId}, npc={session.NpcName}, prompt={Preview(prompt)}, options={options.Count}.", LogLevel.Info);
+    }
+
+    private void OnBranchingOptionSelected(Farmer who, string answer)
+    {
+        BranchingDialogueSession? session = this.activeBranchingSession;
+        NPC? npc = this.activeBranchingNpc;
+        if (session is null || npc is null || !session.IsActive)
+            return;
+
+        PlayerDialogueOption? selected = this.activeBranchingOptions.FirstOrDefault(option => option.Id == answer)
+            ?? this.activeBranchingOptions.FirstOrDefault(option => option.Text == answer);
+
+        if (selected is null)
+        {
+            this.Monitor.Log($"[Branching] Malformed selection session={session.SessionId}: answer={answer}. Ending conversation.", LogLevel.Warn);
+            this.EndBranchingConversation("invalid option");
+            return;
+        }
+
+        if (selected.IsExit)
+        {
+            this.Monitor.Log($"[Branching] Selected conversation-ending option session={session.SessionId}, text={Preview(selected.Text)}.", LogLevel.Info);
+            this.EndBranchingConversation("player selected exit option");
+            return;
+        }
+
+        string mode = selected.IsNpcInitiates ? "npc_initiates" : "turn";
+        this.RequestBranchingAsync(session, npc, mode, selected, this.pendingRequestId);
+    }
+
+    private void EndBranchingConversation(string reason)
+    {
+        BranchingDialogueSession? session = this.activeBranchingSession;
+        if (session is not null)
+        {
+            session.IsActive = false;
+            session.IsEnded = true;
+            this.Monitor.Log($"[Branching] Conversation end session={session.SessionId}, npc={session.NpcName}, reason={reason}, turns={session.TurnCount}.", LogLevel.Info);
+        }
+
+        this.activeBranchingSession = null;
+        this.activeBranchingNpc = null;
+        this.activeBranchingOptions = Array.Empty<PlayerDialogueOption>();
+
+        if (Game1.activeClickableMenu is DialogueBox)
+            Game1.exitActiveMenu();
+    }
+
+    private static BranchingDialogueResponse CreateFallbackBranchingResponse(string mode)
+    {
+        if (mode.Equals("opening_options", StringComparison.OrdinalIgnoreCase))
+        {
+            return new BranchingDialogueResponse
+            {
+                PlayerOptions = new[]
+                {
+                    new PlayerDialogueOption { Id = "fallback_open", Text = "Hi. How are you doing?", Action = "choose" },
+                    new PlayerDialogueOption { Id = "let_them_speak_first", Text = "Let them speak first.", Action = "npc_initiates" },
+                    new PlayerDialogueOption { Id = "exit", Text = "Never mind.", Action = "exit", EndsConversation = true }
+                },
+                Error = "Fallback branching options used."
+            };
+        }
+
+        return new BranchingDialogueResponse
+        {
+            NpcResponse = "Sorry, I lost my train of thought for a moment.",
+            PlayerOptions = new[]
+            {
+                new PlayerDialogueOption { Id = "fallback_continue", Text = "That's okay.", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_end", Text = "I should get going.", Action = "exit", EndsConversation = true }
+            },
+            Error = "Fallback branching response used."
+        };
     }
 
     private void RequestGeneratedForHarmony(NPC npc, long requestId)

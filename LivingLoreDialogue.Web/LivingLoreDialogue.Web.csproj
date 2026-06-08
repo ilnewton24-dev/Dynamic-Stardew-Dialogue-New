@@ -16,6 +16,7 @@
     <Compile Include="..\Repositories\*.cs" LinkBase="Repositories" />
     <Compile Include="..\Services\CharacterSyncService.cs" LinkBase="Services" />
     <Compile Include="..\Services\CharacterValidationService.cs" LinkBase="Services" />
+    <Compile Include="..\Services\BranchingDialogueGenerationService.cs" LinkBase="Services" />
     <Compile Include="..\Services\DashboardHealthService.cs" LinkBase="Services" />
     <Compile Include="..\Services\DialogueExplanationService.cs" LinkBase="Services" />
     <Compile Include="..\Services\DialogueContextBuilderService.cs" LinkBase="Services" />

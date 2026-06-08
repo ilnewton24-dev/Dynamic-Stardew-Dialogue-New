@@ -138,6 +138,7 @@ builder.Services.AddScoped<DialogueGenerationService>(sp => new DialogueGenerati
     sp.GetRequiredService<OpenAiDialogueService>(),
     sp.GetRequiredService<DialogueExplanationService>(),
     sp.GetRequiredService<DialogueQualityService>()));
+builder.Services.AddScoped<BranchingDialogueGenerationService>();
 
 WebApplication app = builder.Build();
 
@@ -501,6 +502,7 @@ app.MapPost("/api/conflicts/{id:long}/reviewed", async (long id, LoreConflictRep
 
 app.MapPost("/api/dialogue/test", GenerateDialogue);
 app.MapPost("/api/dialogue/generate", GenerateDialogue);
+app.MapPost("/api/dialogue/branching", GenerateBranchingDialogue);
 
 // Recent generated dialogue lines for the explanation/review list.
 app.MapGet("/api/dialogue/history", async (GeneratedDialogueHistoryRepository repo) =>
@@ -1038,6 +1040,70 @@ static async Task<IResult> GenerateDialogue(
                 Dialogue = ""
             },
             historyId = 0L
+        });
+    }
+}
+
+static async Task<IResult> GenerateBranchingDialogue(
+    BranchingDialogueRequest request,
+    BranchingDialogueGenerationService service,
+    ILoggerFactory loggerFactory)
+{
+    ILogger logger = loggerFactory.CreateLogger("BranchingDialogueEndpoint");
+    request.Context.RequestSource = string.IsNullOrWhiteSpace(request.Context.RequestSource)
+        ? "SMAPI-Branching"
+        : request.Context.RequestSource;
+
+    if (request.SaveContext is not null)
+        logger.LogInformation(
+            "[Branching] Save context received: saveFileName={SaveFileName}, playerName={PlayerName}, farmName={FarmName}, location={Location}, season={Season}, day={Day}.",
+            request.SaveContext.SaveFileName ?? "(none)",
+            request.SaveContext.PlayerName,
+            request.SaveContext.FarmName,
+            request.SaveContext.Location,
+            request.SaveContext.Season,
+            request.SaveContext.Day);
+
+    logger.LogInformation(
+        "[Branching] Request mode={Mode}, npc={Npc}, turn={Turn}/{MaxTurn}, history={HistoryCount}.",
+        request.Mode,
+        request.Context.CharacterName,
+        request.TurnCount,
+        request.MaxTurnCount,
+        request.History.Count);
+
+    try
+    {
+        BranchingDialogueResponse response = await service.GenerateAsync(request);
+        bool profileResolved = !string.IsNullOrWhiteSpace(response.ActivePlayerProfileName);
+        logger.LogInformation(
+            "[Branching] Result npc={Npc}, profileIncluded={ProfileIncluded}, profileName={ProfileName}, matchMethod={MatchMethod}, options={OptionCount}, end={End}, error={Error}.",
+            request.Context.CharacterName,
+            profileResolved,
+            profileResolved ? response.ActivePlayerProfileName : "(default farmer)",
+            response.PlayerProfileMatchMethod,
+            response.PlayerOptions.Count,
+            response.ConversationShouldEnd,
+            response.Error);
+
+        if (!profileResolved)
+            logger.LogInformation("[Branching] No custom player profile resolved; default Stardew farmer profile was injected into the prompt.");
+
+        return Results.Ok(response);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "[Branching] Endpoint failed for npc={Npc}.", request.Context.CharacterName);
+        return Results.Ok(new BranchingDialogueResponse
+        {
+            NpcResponse = "Sorry, I lost my train of thought for a moment.",
+            PlayerOptions = new[]
+            {
+                new PlayerDialogueOption { Id = "fallback_continue", Text = "That's okay.", Action = "choose" },
+                new PlayerDialogueOption { Id = "fallback_end", Text = "I should get going.", Action = "exit", EndsConversation = true }
+            },
+            Error = ex.Message,
+            SaveContext = request.SaveContext
         });
     }
 }
