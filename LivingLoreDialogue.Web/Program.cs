@@ -1,10 +1,12 @@
 using System.Text.Json;
+using System.Threading.Channels;
 using LivingLoreDialogue.Data;
 using LivingLoreDialogue.Models;
 using LivingLoreDialogue.Repositories;
 using LivingLoreDialogue.Services;
 using LivingLoreDialogue.Web;
 
+var dashboardStartupSw = System.Diagnostics.Stopwatch.StartNew();
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
 // Port is configurable so the SMAPI mod can pass LocalDashboardPort, but the dashboard always
@@ -140,22 +142,39 @@ builder.Services.AddScoped<DialogueGenerationService>(sp => new DialogueGenerati
     sp.GetRequiredService<DialogueQualityService>()));
 builder.Services.AddScoped<BranchingDialogueGenerationService>();
 
+// Live log sink — captures .NET logger messages for the /Logs dashboard page.
+LogSink logSink = new();
+builder.Services.AddSingleton(logSink);
+builder.Logging.AddProvider(new LogSinkProvider(logSink));
+
 WebApplication app = builder.Build();
+Console.WriteLine($"[Dashboard Startup] Build service provider/app: {dashboardStartupSw.ElapsedMilliseconds} ms");
 
 using (IServiceScope scope = app.Services.CreateScope())
 {
     LivingLoreWebOptions webOptions = scope.ServiceProvider.GetRequiredService<LivingLoreWebOptions>();
+    var databaseInitSw = System.Diagnostics.Stopwatch.StartNew();
     await scope.ServiceProvider.GetRequiredService<DatabaseInitializer>()
         .InitializeAsync(webOptions.SchemaPath, webOptions.SeedPath, seedOnFirstRun: true);
+    databaseInitSw.Stop();
+    Console.WriteLine($"[Dashboard Startup] Database initialization: {databaseInitSw.ElapsedMilliseconds} ms");
+    var seedScenarioSw = System.Diagnostics.Stopwatch.StartNew();
     await scope.ServiceProvider.GetRequiredService<TestScenarioRepository>().SeedDefaultsAsync();
+    seedScenarioSw.Stop();
+    Console.WriteLine($"[Dashboard Startup] Test scenario seed: {seedScenarioSw.ElapsedMilliseconds} ms");
+    var settingsReadSw = System.Diagnostics.Stopwatch.StartNew();
     IReadOnlyDictionary<string, string?> savedSettings = (await scope.ServiceProvider.GetRequiredService<AppSettingsRepository>().GetAllAsync())
         .ToDictionary(setting => setting.Key, setting => setting.Value);
+    settingsReadSw.Stop();
+    Console.WriteLine($"[Dashboard Startup] Settings read: {settingsReadSw.ElapsedMilliseconds} ms");
     webOptions.OpenAiModel = savedSettings.GetValueOrDefault("OpenAiModel") ?? webOptions.OpenAiModel;
     webOptions.GamePath = savedSettings.GetValueOrDefault("GamePath") ?? webOptions.GamePath;
     webOptions.ModsFolderPath = savedSettings.GetValueOrDefault("ModsFolderPath") ?? webOptions.ModsFolderPath;
     if (bool.TryParse(savedSettings.GetValueOrDefault("EnableLiveInGameDialogueGeneration"), out bool liveGenerationEnabled))
         webOptions.EnableLiveInGameDialogueGeneration = liveGenerationEnabled;
 }
+dashboardStartupSw.Stop();
+Console.WriteLine($"[Dashboard Startup] Total pre-listen startup: {dashboardStartupSw.ElapsedMilliseconds} ms");
 
 app.UseStaticFiles();
 app.MapRazorPages();
@@ -888,6 +907,36 @@ app.MapPost("/api/settings", async (SettingsRequest request, AppSettingsReposito
     return Results.NoContent();
 });
 
+// Live log stream — Server-Sent Events feed for the /Logs dashboard page.
+app.MapGet("/api/logs/stream", async (LogSink sink, HttpContext ctx, CancellationToken ct) =>
+{
+    ctx.Response.ContentType = "text/event-stream";
+    ctx.Response.Headers["Cache-Control"] = "no-cache";
+    ctx.Response.Headers["X-Accel-Buffering"] = "no";
+    await ctx.Response.Body.FlushAsync(ct);
+
+    foreach (LogEntry entry in sink.GetHistory())
+    {
+        await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(entry)}\n\n", ct);
+        await ctx.Response.Body.FlushAsync(ct);
+    }
+
+    Channel<LogEntry> channel = sink.Subscribe();
+    try
+    {
+        await foreach (LogEntry entry in channel.Reader.ReadAllAsync(ct))
+        {
+            await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(entry)}\n\n", ct);
+            await ctx.Response.Body.FlushAsync(ct);
+        }
+    }
+    catch (OperationCanceledException) { }
+    finally
+    {
+        sink.Unsubscribe(channel);
+    }
+});
+
 app.Run();
 
 static async Task<IResult> GenerateDialogue(
@@ -1106,20 +1155,12 @@ static async Task<IResult> GenerateBranchingDialogue(
     catch (Exception ex)
     {
         logger.LogError(ex, "[Branching] Endpoint failed for npc={Npc}.", request.Context.CharacterName);
-        return Results.Ok(new BranchingDialogueResponse
-        {
-            NpcResponse = "Let's talk about something simple for now.",
-            PlayerOptions = new[]
-            {
-                new PlayerDialogueOption { Id = "fallback_continue", Text = "That's okay.", Action = "choose" },
-                new PlayerDialogueOption { Id = "fallback_more", Text = "Tell me more.", Action = "choose" },
-                new PlayerDialogueOption { Id = "fallback_day", Text = "How has your day been otherwise?", Action = "choose" },
-                new PlayerDialogueOption { Id = "fallback_farm", Text = "I've been keeping busy on the farm.", Action = "choose" },
-                new PlayerDialogueOption { Id = "fallback_end", Text = "I should get going.", Action = "exit", EndsConversation = true }
-            },
-            Error = ex.Message,
-            SaveContext = request.SaveContext
-        });
+        // Return 500 so the SMAPI client knows generation failed and can show a neutral
+        // in-game message.  Never return HTTP 200 with fake NPC dialogue on failure —
+        // that hides the real error and makes debugging confusing.
+        return Results.Json(
+            new { error = ex.Message, npc = request.Context.CharacterName },
+            statusCode: 500);
     }
 }
 

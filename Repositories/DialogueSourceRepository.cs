@@ -96,6 +96,46 @@ public sealed class DialogueSourceRepository
         await transaction.CommitAsync();
     }
 
+    public async Task<int> MarkSeenForFilesAsync(IEnumerable<(string? SourceModId, string FilePath)> scannedFiles, DateTime scanTime)
+    {
+        List<(string? SourceModId, string FilePath)> files = scannedFiles
+            .Distinct()
+            .ToList();
+        if (files.Count == 0)
+            return 0;
+
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+        await using SqliteTransaction transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+
+        int updated = 0;
+        string scanTimestamp = scanTime.ToString("O");
+        string now = DateTime.UtcNow.ToString("O");
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = @"
+            UPDATE DialogueSources
+            SET IsActive = 1,
+                LastSeen = @scanTime,
+                UpdatedAt = @now
+            WHERE FilePath = @filePath
+              AND IFNULL(SourceModId, '') = IFNULL(@sourceModId, '');
+            ";
+
+        foreach ((string? sourceModId, string filePath) in files)
+        {
+            command.Parameters.Clear();
+            command.Parameters.AddWithValue("@filePath", filePath);
+            command.Parameters.AddWithValue("@sourceModId", (object?)sourceModId ?? DBNull.Value);
+            command.Parameters.AddWithValue("@scanTime", scanTimestamp);
+            command.Parameters.AddWithValue("@now", now);
+            updated += await command.ExecuteNonQueryAsync();
+        }
+
+        await transaction.CommitAsync();
+        return updated;
+    }
+
     public async Task<int> DeactivateStaleForScannedFilesAsync(IEnumerable<(string? SourceModId, string FilePath)> scannedFiles, DateTime scanTime)
     {
         List<(string? SourceModId, string FilePath)> files = scannedFiles

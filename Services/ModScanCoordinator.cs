@@ -55,6 +55,7 @@ public sealed class ModScanCoordinator
         DateTime startedAt = DateTime.UtcNow;
         List<string> errors = new();
         List<string> fatalErrors = new();
+        List<(string TaskName, long DurationMs, bool BlocksGameThread, string Category)> bottlenecks = new();
 
         try
         {
@@ -74,12 +75,18 @@ public sealed class ModScanCoordinator
             this.Report(progress, "vanilla character scan", "Vanilla scan started.", TimeSpan.Zero, elapsed());
             ModScanResult vanillaScanResult = await this.vanillaScanner.ScanAsync(gamePath);
             this.Report(progress, "vanilla character scan", "Vanilla scan completed.", phaseTimer.Elapsed, elapsed(), vanillaScanResult.FilesInspected, vanillaScanResult.Candidates.Count, 0, vanillaScanResult.Errors.Count, vanillaScanResult.Errors.Count);
+            this.log?.Invoke($"[Startup Performance] Vanilla scan: {phaseTimer.ElapsedMilliseconds}ms, {vanillaScanResult.Candidates.Count} vanilla character(s).");
+            this.log?.Invoke($"[File Scan] Vanilla character scan: {vanillaScanResult.FilesInspected} files, {vanillaScanResult.FilesScanned} changed, {vanillaScanResult.FilesSkippedFromCache} skipped, duration={phaseTimer.ElapsedMilliseconds} ms.");
+            bottlenecks.Add(("Vanilla character scan", phaseTimer.ElapsedMilliseconds, false, "file-scan"));
 
             phaseTimer.Restart();
             this.Report(progress, "mod manifest discovery", "Mod manifest discovery and character scan started.", TimeSpan.Zero, elapsed());
             ModScanResult modScanResult = await this.scanner.ScanAsync(modsFolderPath);
             this.Report(progress, "mod manifest discovery", "Mod manifest discovery completed.", phaseTimer.Elapsed, elapsed(), modScanResult.FilesInspected, modScanResult.Mods.Count, 0, modScanResult.Errors.Count, modScanResult.Errors.Count, modScanResult.TotalFilesQueued, modScanResult.FilesScanned, modScanResult.FilesSkippedFromCache, modScanResult.FilesFailed, modScanResult.FilesRemaining, modScanResult.LastFileProcessed, modScanResult.TimedOut, modScanResult.DatabaseStatePartial);
             this.Report(progress, "mod character scan", "Mod character scan completed.", phaseTimer.Elapsed, elapsed(), modScanResult.FilesInspected, modScanResult.Candidates.Count, 0, modScanResult.Errors.Count, modScanResult.Errors.Count, modScanResult.TotalFilesQueued, modScanResult.FilesScanned, modScanResult.FilesSkippedFromCache, modScanResult.FilesFailed, modScanResult.FilesRemaining, modScanResult.LastFileProcessed, modScanResult.TimedOut, modScanResult.DatabaseStatePartial);
+            this.log?.Invoke($"[Startup Performance] Mod scan: {phaseTimer.ElapsedMilliseconds}ms, {modScanResult.Candidates.Count} candidate(s) from {modScanResult.Mods.Count} mod(s), {modScanResult.FilesSkippedFromCache} file(s) from cache.");
+            this.log?.Invoke($"[File Scan] Mod manifest/character scan: {modScanResult.FilesInspected} files, {modScanResult.FilesScanned} changed, {modScanResult.FilesSkippedFromCache} skipped, duration={phaseTimer.ElapsedMilliseconds} ms.");
+            bottlenecks.Add(("Mod manifest/character scan", phaseTimer.ElapsedMilliseconds, false, "file-scan"));
 
             ModScanResult scanResult = CombineScanResults(modScanResult, vanillaScanResult);
             errors.AddRange(scanResult.Errors);
@@ -88,8 +95,10 @@ public sealed class ModScanCoordinator
 
             phaseTimer.Restart();
             this.Report(progress, "database upsert", "Database upsert started.", TimeSpan.Zero, elapsed(), scanResult.FilesInspected, scanResult.Candidates.Count, 0, errors.Count, fatalErrors.Count);
-            foreach (ScannedMod mod in scanResult.Mods)
-                await this.scannedModRepository.UpsertAsync(mod);
+
+            var modUpsertSw = Stopwatch.StartNew();
+            await this.scannedModRepository.UpsertRangeAsync(scanResult.Mods);
+            modUpsertSw.Stop();
             int modsDeactivated = await this.scannedModRepository.MarkMissingInactiveAsync(scanResult.Mods.Select(mod => mod.UniqueId), DateTime.UtcNow);
 
             int modsFoundInScan = scanResult.Mods.Count;
@@ -99,18 +108,25 @@ public sealed class ModScanCoordinator
                 $"[Scan reconcile] Mods folder '{modsFolderPath}': found {modsFoundInScan} mod(s) in current scan; " +
                 $"database now holds {modsStored} mod record(s) ({modsActive} active, {modsStored - modsActive} historical/inactive); " +
                 $"{modsDeactivated} mod(s) marked inactive this scan.");
+            this.log?.Invoke($"[DB Write] Mod upsert batch: {modsFoundInScan} records in {modUpsertSw.ElapsedMilliseconds} ms, transaction=batch, lockWait=included-in-duration.");
 
             // Score every discovered candidate, persist the validation results (the review queue
             // dashboard reads from these), and only import candidates that clear the threshold.
             IReadOnlyList<CharacterValidationResult> validationResults = this.validationService.Validate(scanResult.Candidates);
-            foreach (CharacterValidationResult validationResult in validationResults)
-                await this.validationRepository.UpsertAsync(validationResult);
+            var validationUpsertSw = Stopwatch.StartNew();
+            await this.validationRepository.UpsertRangeAsync(validationResults);
+            validationUpsertSw.Stop();
+            this.log?.Invoke($"[DB Write] Validation upsert batch: {validationResults.Count} records in {validationUpsertSw.ElapsedMilliseconds} ms, transaction=batch, lockWait=included-in-duration.");
             this.Report(progress, "database upsert", "Database upsert completed.", phaseTimer.Elapsed, elapsed(), scanResult.FilesInspected, scanResult.Candidates.Count, 0, errors.Count, fatalErrors.Count);
+            this.log?.Invoke($"[Startup Performance] DB upsert (mods+validation): {phaseTimer.ElapsedMilliseconds}ms, {modsFoundInScan} mod(s), {validationResults.Count} validation result(s).");
+            bottlenecks.Add(("DB upsert (mods+validation)", phaseTimer.ElapsedMilliseconds, false, "database"));
 
             phaseTimer.Restart();
             this.Report(progress, "merge/reconcile", "Merge/reconcile started.", TimeSpan.Zero, elapsed(), scanResult.FilesInspected, scanResult.Candidates.Count, 0, errors.Count, fatalErrors.Count);
             List<ScannedCharacter> importable = await this.BuildImportableCharactersAsync(scanResult.Candidates, validationResults);
             this.Report(progress, "merge/reconcile", "Merge/reconcile completed.", phaseTimer.Elapsed, elapsed(), 0, importable.Count, 0, errors.Count, fatalErrors.Count);
+            this.log?.Invoke($"[Startup Performance] Merge/reconcile: {phaseTimer.ElapsedMilliseconds}ms, {importable.Count} importable character(s).");
+            bottlenecks.Add(("Merge/reconcile", phaseTimer.ElapsedMilliseconds, false, "database"));
 
             phaseTimer.Restart();
             this.Report(progress, "database upsert", "Database character upsert started.", TimeSpan.Zero, elapsed(), 0, importable.Count, 0, errors.Count, fatalErrors.Count);
@@ -123,6 +139,8 @@ public sealed class ModScanCoordinator
                 $"added {syncSummary.CharactersAdded}, updated {syncSummary.CharactersUpdated}, reactivated {syncSummary.CharactersReactivated}, " +
                 $"marked inactive {syncSummary.CharactersMarkedInactive} this scan.");
             this.Report(progress, "database upsert", "Database character upsert completed.", phaseTimer.Elapsed, elapsed(), 0, importable.Count, 0, errors.Count, fatalErrors.Count);
+            this.log?.Invoke($"[Startup Performance] Character sync: {phaseTimer.ElapsedMilliseconds}ms, added={syncSummary.CharactersAdded}, updated={syncSummary.CharactersUpdated}, reactivated={syncSummary.CharactersReactivated}, inactive={syncSummary.CharactersMarkedInactive}.");
+            bottlenecks.Add(("Character sync", phaseTimer.ElapsedMilliseconds, false, "database"));
 
             DialogueSourceScanSummary? dialogueScanSummary = null;
             if (this.dialogueSourceScanner is not null)
@@ -142,6 +160,13 @@ public sealed class ModScanCoordinator
                     $"warnings={dialogueScan.Warnings.Count}, recovered={dialogueScan.Diagnostics.Count}, errors={dialogueScan.Errors.Count}.");
                 if (dialogueScan.Warnings.Count > 0)
                     this.log?.Invoke($"Dialogue source scan diagnostics: {dialogueScan.Warnings.Count} zero-line dialogue file(s) classified. See dashboard scan details for paths.");
+                this.log?.Invoke($"[Startup Performance] Dialogue source scan: {phaseTimer.ElapsedMilliseconds}ms, {dialogueScan.SourcesFound} line(s), {dialogueScan.FilesScanned} scanned, {dialogueScan.FilesSkippedFromCache} cached.");
+                this.log?.Invoke($"[File Scan] Dialogue source scan: {dialogueScan.TotalFilesQueued} files, {dialogueScan.FilesScanned} changed, {dialogueScan.FilesSkippedFromCache} skipped, duration={phaseTimer.ElapsedMilliseconds} ms.");
+                this.log?.Invoke($"[Cache] Dialogue source file cache: {(dialogueScan.FilesSkippedFromCache > 0 ? "hit" : "miss")}, {dialogueScan.FilesSkippedFromCache} reused, {dialogueScan.FilesScanned} rebuilt, duration={dialogueScan.CacheLookupMs + dialogueScan.CacheWriteMs} ms.");
+                this.log?.Invoke($"[DB Write] Dialogue source flush: {dialogueScan.SourcesUpserted} records in {dialogueScan.SourceFlushMs} ms, transaction=batch, lockWait=included-in-duration.");
+                this.log?.Invoke($"[DB Write] Dialogue source cached LastSeen: {dialogueScan.CachedSourcesMarkedSeen} records in {dialogueScan.CachedMarkSeenMs} ms, transaction=batch, lockWait=included-in-duration.");
+                this.log?.Invoke($"[Startup Performance] Dialogue source scan detail: dbRead={dialogueScan.DatabaseReadMs}ms, queue={dialogueScan.QueueDiscoveryMs}ms, cacheLookup={dialogueScan.CacheLookupMs}ms, parse={dialogueScan.ParseMs}ms, extract={dialogueScan.ExtractMs}ms, cacheWrite={dialogueScan.CacheWriteMs}ms, dbFlush={dialogueScan.SourceFlushMs}ms, cachedMarkSeen={dialogueScan.CachedMarkSeenMs}ms, deactivate={dialogueScan.DeactivateMs}ms, summaries={dialogueScan.SummaryRefreshMs}ms.");
+                bottlenecks.Add(("Dialogue source scan", phaseTimer.ElapsedMilliseconds, false, "file-scan/database"));
             }
             bool isPartial = modScanResult.TimedOut || dialogueScanSummary?.TimedOut == true;
             ModScanSummary summary = new()
@@ -174,6 +199,8 @@ public sealed class ModScanCoordinator
 
             await this.scanHistoryRepository.AddAsync(triggerSource, summary);
             this.log?.Invoke($"Mod scan from {triggerSource}: {summary.ModsScanned} mods, {summary.VanillaCharactersFound} vanilla characters, {summary.ModdedCharactersFound} modded characters, {summary.MergedCanonicalCharacters} canonical profiles, success={summary.Success}.");
+            this.log?.Invoke($"[Startup Performance] Total scan ({triggerSource}): {(summary.CompletedAt - summary.StartedAt).TotalMilliseconds:0}ms. mods={summary.ModsScanned}, characters={summary.CharactersFound}, dialogueLines={dialogueScanSummary?.SourcesFound ?? 0}.");
+            this.log?.Invoke(BuildStartupSummary(triggerSource, summary, bottlenecks));
             return summary;
         }
         catch (Exception ex)
@@ -282,6 +309,25 @@ public sealed class ModScanCoordinator
             DatabaseStatePartial = modScanResult.DatabaseStatePartial || vanillaScanResult.DatabaseStatePartial,
             Errors = vanillaScanResult.Errors.Concat(modScanResult.Errors).ToArray()
         };
+    }
+
+    private static string BuildStartupSummary(
+        string triggerSource,
+        ModScanSummary summary,
+        IReadOnlyList<(string TaskName, long DurationMs, bool BlocksGameThread, string Category)> bottlenecks)
+    {
+        long totalMs = (long)(summary.CompletedAt - summary.StartedAt).TotalMilliseconds;
+        long blockingMs = bottlenecks.Where(item => item.BlocksGameThread).Sum(item => item.DurationMs);
+        long deferredMs = Math.Max(0, totalMs - blockingMs);
+        string top = string.Join("; ", bottlenecks
+            .OrderByDescending(item => item.DurationMs)
+            .Take(5)
+            .Select((item, index) => $"{index + 1}. {item.TaskName} - {item.DurationMs} ms ({item.Category})"));
+
+        if (string.IsNullOrWhiteSpace(top))
+            top = "none";
+
+        return $"[Startup Summary] {triggerSource} scan: Total Living Lore startup work: {totalMs} ms; Blocking game-thread work: {blockingMs} ms; Deferred/background work: {deferredMs} ms; Top bottlenecks: {top}.";
     }
 
     private void Report(

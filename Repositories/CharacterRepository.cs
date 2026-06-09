@@ -246,6 +246,65 @@ public sealed class CharacterRepository
         await command.ExecuteNonQueryAsync();
     }
 
+    /// <summary>
+    /// Applies all pending scan updates in a single connection and transaction, replacing the
+    /// N-connections-per-character pattern that caused lock contention during full scans.
+    /// </summary>
+    public async Task BatchUpdateFromScanAsync(IReadOnlyList<(long CharacterId, ScannedCharacter Scanned)> updates)
+    {
+        if (updates.Count == 0)
+            return;
+
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+        await using SqliteTransaction transaction = connection.BeginTransaction();
+
+        try
+        {
+            await using SqliteCommand command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+                UPDATE Characters
+                SET Name = @name,
+                    CanonicalCharacterId = @canonicalCharacterId,
+                    InternalName = @internalName,
+                    DisplayName = @displayName,
+                    Description = @description,
+                    Personality = @personality,
+                    Occupation = @occupation,
+                    HomeLocation = @homeLocation,
+                    IsActive = 1,
+                    IsVanilla = @isVanilla,
+                    IsCustomNpc = @isCustomNpc,
+                    IsExtension = @isExtension,
+                    LastSeen = @lastSeen,
+                    SourceModId = @sourceModId,
+                    SourceModName = @sourceModName,
+                    SourceModVersion = @sourceModVersion,
+                    SourceModAuthor = @sourceModAuthor,
+                    CharacterFingerprint = @fingerprint,
+                    LastModified = @lastModified,
+                    RawModData = @rawModData
+                WHERE Id = @id;
+                ";
+
+            foreach ((long characterId, ScannedCharacter scanned) in updates)
+            {
+                command.Parameters.Clear();
+                command.Parameters.AddWithValue("@id", characterId);
+                AddScannedParameters(command, scanned);
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await transaction.CommitAsync();
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
+        }
+    }
+
     public async Task<ClearCharactersSummary> ClearAllForRescanAsync()
     {
         await using SqliteConnection connection = this.connectionFactory.CreateConnection();

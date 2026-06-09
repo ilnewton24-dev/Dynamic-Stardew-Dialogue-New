@@ -62,33 +62,49 @@ public sealed class DashboardProcessService : IDisposable
     public async Task<StartResult> EnsureRunningAsync()
     {
         // 1. Reuse an already-running healthy dashboard (e.g. started manually or by a prior launch).
+        Stopwatch healthyProbeSw = Stopwatch.StartNew();
         if (await this.IsHealthyAsync())
         {
+            healthyProbeSw.Stop();
+            this.logInfo($"[Dashboard Startup] Initial health probe: {healthyProbeSw.ElapsedMilliseconds} ms");
             this.logInfo($"Living Lore dashboard already running at {this.baseUrl}; reusing it.");
             return new StartResult(StartOutcome.ReusedExisting, Available: true, Owned: false, "Reused existing dashboard.");
         }
+        healthyProbeSw.Stop();
+        this.logInfo($"[Dashboard Startup] Initial health probe: {healthyProbeSw.ElapsedMilliseconds} ms");
 
         // 2. Port in use but not answering our health endpoint => a different app holds the port.
+        Stopwatch portCheckSw = Stopwatch.StartNew();
         if (IsPortInUse(this.port))
         {
+            portCheckSw.Stop();
+            this.logInfo($"[Dashboard Startup] Port check: {portCheckSw.ElapsedMilliseconds} ms");
             string msg = $"Port {this.port} is in use but did not respond to {this.baseUrl}/api/health. "
                        + "Another application may be using this port. The dashboard was not started.";
             this.logError(msg);
             return new StartResult(StartOutcome.PortConflict, Available: false, Owned: false, msg);
         }
+        portCheckSw.Stop();
+        this.logInfo($"[Dashboard Startup] Port check: {portCheckSw.ElapsedMilliseconds} ms");
 
         // 3. Locate the published dashboard executable.
+        Stopwatch executableCheckSw = Stopwatch.StartNew();
         if (!File.Exists(this.executablePath))
         {
+            executableCheckSw.Stop();
+            this.logInfo($"[Dashboard Startup] Executable check: {executableCheckSw.ElapsedMilliseconds} ms");
             string msg = $"Dashboard executable not found at '{this.executablePath}'. "
                        + "Re-run package-local-mod.ps1 to publish the dashboard, or disable EnableLocalDashboardAutoStart.";
             this.logError(msg);
             return new StartResult(StartOutcome.ExecutableNotFound, Available: false, Owned: false, msg);
         }
+        executableCheckSw.Stop();
+        this.logInfo($"[Dashboard Startup] Executable check: {executableCheckSw.ElapsedMilliseconds} ms");
 
         // 4. Start the dashboard as a child process bound to the configured localhost port.
         try
         {
+            Stopwatch processStartSw = Stopwatch.StartNew();
             ProcessStartInfo startInfo = new()
             {
                 FileName = this.executablePath,
@@ -99,6 +115,8 @@ public sealed class DashboardProcessService : IDisposable
             startInfo.EnvironmentVariables["LIVINGLORE_DASHBOARD_PORT"] = this.port.ToString();
 
             this.startedProcess = Process.Start(startInfo);
+            processStartSw.Stop();
+            this.logInfo($"[Dashboard Startup] Process.Start: {processStartSw.ElapsedMilliseconds} ms");
             if (this.startedProcess is null)
             {
                 string msg = "Failed to start the dashboard process (no process handle returned).";
@@ -122,7 +140,10 @@ public sealed class DashboardProcessService : IDisposable
 
         // 5. Wait for the health endpoint to come up within the timeout.
         this.logInfo($"Living Lore dashboard health check pending at {this.baseUrl}/api/health.");
+        Stopwatch healthWaitSw = Stopwatch.StartNew();
         HealthCheckResult healthResult = await this.WaitForHealthyAsync(CancellationToken.None);
+        healthWaitSw.Stop();
+        this.logInfo($"[Dashboard Startup] Health wait: {healthWaitSw.ElapsedMilliseconds} ms");
         if (healthResult == HealthCheckResult.Healthy)
         {
             this.LogHealthSucceeded();

@@ -59,10 +59,10 @@ public sealed class BranchingDialogueGenerationService
         }
         catch (Exception ex)
         {
-            result.Error = $"OpenAI branching dialogue generation failed: {ex.Message}";
-            result.NpcResponse = request.Mode.Equals("opening_options", StringComparison.OrdinalIgnoreCase) ? "" : "Let's talk about something simple for now.";
-            result.PlayerOptions = FallbackOptions(request.Mode);
-            return result;
+            // Re-throw so the endpoint can return a proper HTTP error status instead of
+            // silently returning HTTP 200 with fake NPC dialogue.  Callers should never
+            // see a real NPC line when the underlying generation failed.
+            throw new InvalidOperationException($"Branching dialogue generation failed: {ex.Message}", ex);
         }
     }
 

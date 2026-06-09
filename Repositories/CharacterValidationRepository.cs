@@ -21,26 +21,66 @@ public sealed class CharacterValidationRepository
         await connection.OpenAsync();
 
         await using SqliteCommand command = connection.CreateCommand();
-        command.CommandText = @"
-            INSERT INTO CharacterValidationResults (
-                Name, SourceModId, SourceModName, Score, Classification, Imported,
-                Evidence, RulesJson, RawModData, LastSeen, UpdatedDate
-            )
-            VALUES (
-                @name, @sourceModId, @sourceModName, @score, @classification, @imported,
-                @evidence, @rulesJson, @rawModData, @lastSeen, @updatedDate
-            )
-            ON CONFLICT(SourceModId, Name) DO UPDATE SET
-                SourceModName = excluded.SourceModName,
-                Score = excluded.Score,
-                Classification = excluded.Classification,
-                Imported = excluded.Imported,
-                Evidence = excluded.Evidence,
-                RulesJson = excluded.RulesJson,
-                RawModData = excluded.RawModData,
-                LastSeen = excluded.LastSeen,
-                UpdatedDate = excluded.UpdatedDate;
-            ";
+        command.CommandText = ValidationUpsertSql;
+        BindResult(command, result);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    public async Task UpsertRangeAsync(IEnumerable<CharacterValidationResult> results)
+    {
+        List<CharacterValidationResult> list = results.ToList();
+        if (list.Count == 0)
+            return;
+
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+        await using SqliteTransaction transaction = connection.BeginTransaction();
+
+        try
+        {
+            await using SqliteCommand command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = ValidationUpsertSql;
+
+            foreach (CharacterValidationResult result in list)
+            {
+                command.Parameters.Clear();
+                BindResult(command, result);
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await transaction.CommitAsync();
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
+        }
+    }
+
+    private const string ValidationUpsertSql = @"
+        INSERT INTO CharacterValidationResults (
+            Name, SourceModId, SourceModName, Score, Classification, Imported,
+            Evidence, RulesJson, RawModData, LastSeen, UpdatedDate
+        )
+        VALUES (
+            @name, @sourceModId, @sourceModName, @score, @classification, @imported,
+            @evidence, @rulesJson, @rawModData, @lastSeen, @updatedDate
+        )
+        ON CONFLICT(SourceModId, Name) DO UPDATE SET
+            SourceModName = excluded.SourceModName,
+            Score = excluded.Score,
+            Classification = excluded.Classification,
+            Imported = excluded.Imported,
+            Evidence = excluded.Evidence,
+            RulesJson = excluded.RulesJson,
+            RawModData = excluded.RawModData,
+            LastSeen = excluded.LastSeen,
+            UpdatedDate = excluded.UpdatedDate;
+        ";
+
+    private static void BindResult(SqliteCommand command, CharacterValidationResult result)
+    {
         command.Parameters.AddWithValue("@name", result.Name);
         command.Parameters.AddWithValue("@sourceModId", result.SourceModId);
         command.Parameters.AddWithValue("@sourceModName", (object?)result.SourceModName ?? DBNull.Value);
@@ -52,7 +92,6 @@ public sealed class CharacterValidationRepository
         command.Parameters.AddWithValue("@rawModData", (object?)result.RawModData ?? DBNull.Value);
         command.Parameters.AddWithValue("@lastSeen", result.LastSeen.ToString("O"));
         command.Parameters.AddWithValue("@updatedDate", DateTime.UtcNow.ToString("O"));
-        await command.ExecuteNonQueryAsync();
     }
 
     public async Task<IReadOnlyList<CharacterValidationResult>> GetAllAsync()

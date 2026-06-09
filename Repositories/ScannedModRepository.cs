@@ -81,13 +81,49 @@ public sealed class ScannedModRepository
                 IsActive = excluded.IsActive,
                 LastScanTime = excluded.LastScanTime;
             ";
-        command.Parameters.AddWithValue("@uniqueId", mod.UniqueId);
-        command.Parameters.AddWithValue("@name", mod.Name);
-        command.Parameters.AddWithValue("@version", (object?)mod.Version ?? DBNull.Value);
-        command.Parameters.AddWithValue("@author", (object?)mod.Author ?? DBNull.Value);
-        command.Parameters.AddWithValue("@isActive", mod.IsActive ? 1 : 0);
-        command.Parameters.AddWithValue("@lastScanTime", mod.LastScanTime.ToString("O"));
+        BindMod(command, mod);
         await command.ExecuteNonQueryAsync();
+    }
+
+    public async Task UpsertRangeAsync(IEnumerable<ScannedMod> mods)
+    {
+        List<ScannedMod> list = mods.ToList();
+        if (list.Count == 0)
+            return;
+
+        await using SqliteConnection connection = this.connectionFactory.CreateConnection();
+        await connection.OpenAsync();
+        await using SqliteTransaction transaction = connection.BeginTransaction();
+
+        try
+        {
+            await using SqliteCommand command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+                INSERT INTO ScannedMods (UniqueId, Name, Version, Author, IsActive, LastScanTime)
+                VALUES (@uniqueId, @name, @version, @author, @isActive, @lastScanTime)
+                ON CONFLICT(UniqueId) DO UPDATE SET
+                    Name = excluded.Name,
+                    Version = excluded.Version,
+                    Author = excluded.Author,
+                    IsActive = excluded.IsActive,
+                    LastScanTime = excluded.LastScanTime;
+                ";
+
+            foreach (ScannedMod mod in list)
+            {
+                command.Parameters.Clear();
+                BindMod(command, mod);
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await transaction.CommitAsync();
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
+        }
     }
 
     /// <summary>Marks any previously-active mod that is no longer present as inactive. Returns the count deactivated.</summary>
@@ -96,28 +132,54 @@ public sealed class ScannedModRepository
         HashSet<string> active = new(activeUniqueIds, StringComparer.OrdinalIgnoreCase);
         IReadOnlyList<ScannedMod> existing = await this.GetAllAsync();
 
+        List<ScannedMod> toDeactivate = existing
+            .Where(mod => mod.IsActive && !active.Contains(mod.UniqueId))
+            .ToList();
+
+        if (toDeactivate.Count == 0)
+            return 0;
+
         await using SqliteConnection connection = this.connectionFactory.CreateConnection();
         await connection.OpenAsync();
+        await using SqliteTransaction transaction = connection.BeginTransaction();
 
-        int deactivated = 0;
-        foreach (ScannedMod mod in existing)
+        try
         {
-            if (!mod.IsActive || active.Contains(mod.UniqueId))
-                continue;
-
             await using SqliteCommand command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText = @"
                 UPDATE ScannedMods
                 SET IsActive = 0,
                     LastScanTime = @lastScanTime
                 WHERE UniqueId = @uniqueId;
                 ";
-            command.Parameters.AddWithValue("@lastScanTime", timestamp.ToString("O"));
-            command.Parameters.AddWithValue("@uniqueId", mod.UniqueId);
-            await command.ExecuteNonQueryAsync();
-            deactivated++;
+
+            foreach (ScannedMod mod in toDeactivate)
+            {
+                command.Parameters.Clear();
+                command.Parameters.AddWithValue("@lastScanTime", timestamp.ToString("O"));
+                command.Parameters.AddWithValue("@uniqueId", mod.UniqueId);
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await transaction.CommitAsync();
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
         }
 
-        return deactivated;
+        return toDeactivate.Count;
+    }
+
+    private static void BindMod(SqliteCommand command, ScannedMod mod)
+    {
+        command.Parameters.AddWithValue("@uniqueId", mod.UniqueId);
+        command.Parameters.AddWithValue("@name", mod.Name);
+        command.Parameters.AddWithValue("@version", (object?)mod.Version ?? DBNull.Value);
+        command.Parameters.AddWithValue("@author", (object?)mod.Author ?? DBNull.Value);
+        command.Parameters.AddWithValue("@isActive", mod.IsActive ? 1 : 0);
+        command.Parameters.AddWithValue("@lastScanTime", mod.LastScanTime.ToString("O"));
     }
 }

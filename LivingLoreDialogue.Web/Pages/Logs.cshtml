@@ -1,0 +1,31 @@
+@page
+<section class="page">
+    <div class="card-header log-page-header">
+        <div>
+            <h2>Live Logs</h2>
+            <p class="page-intro" id="log-count">Connecting…</p>
+        </div>
+        <div class="log-controls">
+            <select id="log-level-filter" class="log-select">
+                <option value="">All levels</option>
+                <option value="Warning">Warning+</option>
+                <option value="Error">Error+</option>
+            </select>
+            <input id="log-source-filter" placeholder="Filter source…" class="log-filter-input">
+            <input id="log-search" placeholder="Filter message…" class="log-filter-input">
+            <label class="log-toggle-label">
+                <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+            </label>
+            <button id="log-pause" class="chip log-btn">Pause</button>
+            <button id="log-clear" class="chip log-btn">Clear</button>
+            <span id="log-status" class="chip">●&nbsp;Connecting</span>
+        </div>
+    </div>
+    <div id="log-stream" class="log-stream" role="log" aria-live="off" aria-label="Live log output"></div>
+</section>
+
+@section Scripts {
+<script>
+initLiveLogs();
+</script>
+}

@@ -107,6 +107,9 @@ public sealed class LocalDialogueApiClient
         string baseUrl = this.httpClient.BaseAddress?.ToString().TrimEnd('/') ?? "(no base url)";
         string requestJson = JsonSerializer.Serialize(request);
         this.logInfo?.Invoke($"[Branching request] About to call {baseUrl}{BranchingEndpoint} (mode={request.Mode}, source={request.Context.RequestSource}).");
+        this.logInfo?.Invoke(
+            $"[Branching request] NPC={request.Context.CharacterName} Turn={request.TurnCount}/{request.MaxTurnCount} " +
+            $"SelectedOption=\"{request.SelectedOptionText}\" HistoryCount={request.History.Count} SessionId={request.SessionId}");
         this.logInfo?.Invoke($"[Branching request] Payload: {Preview(requestJson)}");
 
         try
@@ -118,7 +121,10 @@ public sealed class LocalDialogueApiClient
 
             if (!response.IsSuccessStatusCode)
             {
-                this.logError?.Invoke($"[Branching response] Non-success status {(int)response.StatusCode}; using fallback options.");
+                this.logError?.Invoke(
+                    $"[Branching response] HTTP {(int)response.StatusCode} {response.ReasonPhrase} from {baseUrl}{BranchingEndpoint}. " +
+                    $"NPC={request.Context.CharacterName}, turn={request.TurnCount}, mode={request.Mode}, session={request.SessionId}. " +
+                    $"Response body: {body}");
                 return null;
             }
 
@@ -129,6 +135,11 @@ public sealed class LocalDialogueApiClient
                 return null;
             }
 
+            this.logInfo?.Invoke(
+                $"[Branching response] Parsed: npcResponse=\"{Preview(result.NpcResponse, 200)}\", " +
+                $"options={result.PlayerOptions.Count}, conversationShouldEnd={result.ConversationShouldEnd}, " +
+                $"error=\"{result.Error}\".");
+
             if (!string.IsNullOrWhiteSpace(result.Error))
                 this.logError?.Invoke($"[Branching response] Server reported error: {result.Error}");
 
@@ -136,7 +147,7 @@ public sealed class LocalDialogueApiClient
         }
         catch (Exception ex)
         {
-            this.logError?.Invoke($"[Branching request] Exception calling server: {ex.GetType().Name}: {ex.Message}");
+            this.logError?.Invoke($"[Branching request] Exception calling {baseUrl}{BranchingEndpoint}: {ex}");
             return null;
         }
     }

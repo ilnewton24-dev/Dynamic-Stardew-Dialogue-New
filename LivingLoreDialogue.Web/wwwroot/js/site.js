@@ -1806,4 +1806,142 @@ function bindProfileDetailForms(profileId) {
     });
 }
 
+function initLiveLogs() {
+    const stream      = document.getElementById("log-stream");
+    const countEl     = document.getElementById("log-count");
+    const levelFilter = document.getElementById("log-level-filter");
+    const srcFilter   = document.getElementById("log-source-filter");
+    const msgSearch   = document.getElementById("log-search");
+    const autoScroll  = document.getElementById("log-autoscroll");
+    const pauseBtn    = document.getElementById("log-pause");
+    const clearBtn    = document.getElementById("log-clear");
+    const statusEl    = document.getElementById("log-status");
+
+    const LEVEL_ORDER = { Trace: 0, Debug: 1, Information: 2, Warning: 3, Error: 4, Critical: 5 };
+    const MAX_ENTRIES = 2000;
+
+    let paused = false;
+    let total  = 0;
+    let shown  = 0;
+
+    function levelClass(level) {
+        if (level === "Warning")                       return "log-warn";
+        if (level === "Error" || level === "Critical") return "log-error";
+        if (level === "Debug" || level === "Trace")    return "log-debug";
+        return "log-info";
+    }
+
+    function passes(level, src, msg) {
+        const minLevel = levelFilter.value;
+        if (minLevel && (LEVEL_ORDER[level] ?? 0) < (LEVEL_ORDER[minLevel] ?? 0)) return false;
+        const sq = srcFilter.value.trim().toLowerCase();
+        if (sq && !src.toLowerCase().includes(sq)) return false;
+        const mq = msgSearch.value.trim().toLowerCase();
+        if (mq && !msg.toLowerCase().includes(mq)) return false;
+        return true;
+    }
+
+    function escHtml(text) {
+        return String(text)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/\n/g, "<br>");
+    }
+
+    function makeRow(entry) {
+        const div = document.createElement("div");
+        div.className = `log-entry ${levelClass(entry.Level)}`;
+        div.dataset.level = entry.Level   || "";
+        div.dataset.src   = entry.Source  || "";
+        div.dataset.msg   = entry.Message || "";
+        div.innerHTML =
+            `<span class="log-ts">${escHtml(entry.Timestamp)}</span>` +
+            `<span class="log-lvl">${escHtml(entry.Level)}</span>` +
+            `<span class="log-src" title="${escHtml(entry.Source)}">${escHtml(entry.Source)}</span>` +
+            `<span class="log-msg">${escHtml(entry.Message)}</span>`;
+        return div;
+    }
+
+    function addEntry(entry) {
+        total++;
+        const div = makeRow(entry);
+        const visible = passes(entry.Level, entry.Source || "", entry.Message || "");
+        div.hidden = !visible;
+        if (visible) shown++;
+        stream.appendChild(div);
+
+        while (stream.children.length > MAX_ENTRIES) {
+            const removed = stream.firstChild;
+            if (!removed.hidden) shown--;
+            stream.removeChild(removed);
+            total--;
+        }
+
+        if (!div.hidden && autoScroll.checked)
+            stream.scrollTop = stream.scrollHeight;
+
+        countEl.textContent = `${shown.toLocaleString()} of ${total.toLocaleString()} entries`;
+    }
+
+    function refilter() {
+        shown = 0;
+        for (const div of stream.children) {
+            const ok = passes(div.dataset.level, div.dataset.src, div.dataset.msg);
+            div.hidden = !ok;
+            if (ok) shown++;
+        }
+        countEl.textContent = `${shown.toLocaleString()} of ${total.toLocaleString()} entries`;
+    }
+
+    levelFilter.addEventListener("change", refilter);
+    srcFilter.addEventListener("input",    refilter);
+    msgSearch.addEventListener("input",    refilter);
+
+    pauseBtn.addEventListener("click", () => {
+        paused = !paused;
+        pauseBtn.textContent = paused ? "Resume" : "Pause";
+        statusEl.className   = paused ? "chip log-status-paused" : "chip log-status-live";
+        statusEl.textContent = paused ? "● Paused" : "● Live";
+    });
+
+    clearBtn.addEventListener("click", () => {
+        stream.innerHTML = "";
+        total = 0; shown = 0;
+        countEl.textContent = "0 entries";
+    });
+
+    function setStatus(state) {
+        const map = {
+            connecting:  { cls: "chip",                 text: "● Connecting" },
+            live:        { cls: "chip log-status-live",  text: "● Live" },
+            reconnecting:{ cls: "chip log-status-error", text: "● Reconnecting…" },
+        };
+        const s = map[state] || map.connecting;
+        statusEl.className   = s.cls;
+        statusEl.textContent = s.text;
+    }
+
+    function connect() {
+        setStatus("connecting");
+        const es = new EventSource("/api/logs/stream");
+
+        es.onopen = () => setStatus("live");
+
+        es.onmessage = ev => {
+            if (paused) return;
+            try { addEntry(JSON.parse(ev.data)); } catch { /* ignore malformed */ }
+        };
+
+        es.onerror = () => {
+            es.close();
+            setStatus("reconnecting");
+            setTimeout(connect, 3000);
+        };
+    }
+
+    countEl.textContent = "0 entries";
+    connect();
+}
+
 document.addEventListener("DOMContentLoaded", initShell);

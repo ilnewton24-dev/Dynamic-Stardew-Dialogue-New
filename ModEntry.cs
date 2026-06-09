@@ -5,8 +5,6 @@ using LivingLoreDialogue.Data;
 using LivingLoreDialogue.Models;
 using LivingLoreDialogue.Repositories;
 using LivingLoreDialogue.Services;
-using Microsoft.Xna.Framework;
-using Microsoft.Xna.Framework.Graphics;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
@@ -63,6 +61,7 @@ public sealed class ModEntry : Mod
 
     private enum BranchingUiState
     {
+        OpeningOptionsLoading,
         ChoosingOption,
         WaitingForApiResponse,
         TypingNpcResponse,
@@ -73,6 +72,9 @@ public sealed class ModEntry : Mod
     // In-memory cache of active character names, refreshed on save load / after scans. The Harmony
     // prefix must decide eligibility synchronously, so it cannot query the database directly.
     private volatile HashSet<string> activeCharacterNames = new(StringComparer.OrdinalIgnoreCase);
+    private readonly TaskCompletionSource<bool> saveLoadedForDeferredScans = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private const int DeferredDialogueSourceScanDelaySeconds = 10;
+    private int deferredDialogueSourceScanStarted;
 
     // Known vanilla villagers whose dialogue can be loaded at save-load time via SMAPI content API.
     // These are registered with the server as StardewValley.Vanilla sources so the prompt builder
@@ -98,7 +100,9 @@ public sealed class ModEntry : Mod
 
     public override void Entry(IModHelper helper)
     {
+        var entrySw = System.Diagnostics.Stopwatch.StartNew();
         this.config = helper.ReadConfig<ModConfig>();
+        long configLoadMs = entrySw.ElapsedMilliseconds;
 
         // ---- Loud startup diagnostics ------------------------------------------------------
         this.Monitor.Log("==================== LIVING LORE DIALOGUE ====================", LogLevel.Info);
@@ -120,18 +124,21 @@ public sealed class ModEntry : Mod
             this.ApplyHarmonyPatches();
         else
             this.Monitor.Log("Harmony interception DISABLED by config; using MenuChanged replacement fallback.", LogLevel.Info);
+        long harmonyMs = entrySw.ElapsedMilliseconds - configLoadMs;
 
         // ---- Event subscriptions -----------------------------------------------------------
+        long eventStartMs = entrySw.ElapsedMilliseconds;
         helper.Events.GameLoop.GameLaunched += this.OnGameLaunched;
         helper.Events.GameLoop.SaveLoaded += this.OnSaveLoaded;
         helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
         helper.Events.Input.ButtonPressed += this.OnButtonPressed;
         helper.Events.Display.MenuChanged += this.OnMenuChanged;
-        helper.Events.Display.RenderedActiveMenu += this.OnRenderedActiveMenu;
         helper.Events.Player.Warped += this.OnWarped;
+        long eventSubscriptionMs = entrySw.ElapsedMilliseconds - eventStartMs;
         this.Monitor.Log("Events subscribed: GameLaunched, SaveLoaded, UpdateTicked, Input.ButtonPressed, Display.MenuChanged, Player.Warped.", LogLevel.Info);
 
         // ---- Console commands --------------------------------------------------------------
+        long commandsStartMs = entrySw.ElapsedMilliseconds;
         helper.ConsoleCommands.Add(
             "livinglore_dialogue",
             "Generate Living Lore dialogue. Usage: livinglore_dialogue <npcName> [topic]",
@@ -144,12 +151,22 @@ public sealed class ModEntry : Mod
             "livinglore_say",
             "Generate dialogue and force-display it in-game. Usage: livinglore_say <npcName>",
             this.HandleSayCommand);
+        long commandRegistrationMs = entrySw.ElapsedMilliseconds - commandsStartMs;
+        entrySw.Stop();
         this.Monitor.Log("Console commands registered: livinglore_dialogue, livinglore_testdialogue, livinglore_say.", LogLevel.Info);
+        this.Monitor.Log($"[Startup Performance] ModEntry config load: {configLoadMs} ms", LogLevel.Info);
+        this.Monitor.Log($"[Startup Performance] Harmony setup: {harmonyMs} ms", LogLevel.Info);
+        this.Monitor.Log($"[Startup Performance] Event subscriptions: {eventSubscriptionMs} ms", LogLevel.Info);
+        this.Monitor.Log($"[Startup Performance] Console command registration: {commandRegistrationMs} ms", LogLevel.Info);
+        this.Monitor.Log($"[Startup Summary] ModEntry blocking game-thread work: {entrySw.ElapsedMilliseconds} ms", LogLevel.Info);
         this.Monitor.Log("=============================================================", LogLevel.Info);
     }
 
     private async void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
     {
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+        long blockingGameThreadMs = 0;
+        long deferredWorkScheduledMs = 0;
         try
         {
             string databasePath = Path.Combine(this.Helper.DirectoryPath, "ValleyLedger.db");
@@ -158,11 +175,19 @@ public sealed class ModEntry : Mod
 
             SqliteConnectionFactory connectionFactory = new(databasePath);
             DatabaseInitializer initializer = new(connectionFactory);
+            var databaseInitSw = System.Diagnostics.Stopwatch.StartNew();
             await initializer.InitializeAsync(schemaPath, seedPath, this.config.EnableSeedDataOnFirstRun);
+            databaseInitSw.Stop();
+            blockingGameThreadMs += databaseInitSw.ElapsedMilliseconds;
+            this.Monitor.Log($"[Startup Performance] Database initialization: {databaseInitSw.ElapsedMilliseconds} ms", LogLevel.Info);
 
             CharacterRepository characterRepository = new(connectionFactory);
             this.characterRepository = characterRepository; // used to validate that a speaker is a real, active character
+            var activeCacheSw = System.Diagnostics.Stopwatch.StartNew();
             await this.RefreshActiveCharacterCacheAsync(); // prime the interception eligibility cache from persisted data
+            activeCacheSw.Stop();
+            blockingGameThreadMs += activeCacheSw.ElapsedMilliseconds;
+            this.Monitor.Log($"[Cache] ActiveCharacterNames: prime, {this.activeCharacterNames.Count} reused, 0 rebuilt, duration={activeCacheSw.ElapsedMilliseconds} ms", LogLevel.Info);
             RelationshipRepository relationshipRepository = new(connectionFactory);
             EventRepository eventRepository = new(connectionFactory);
             MemoryRepository memoryRepository = new(connectionFactory);
@@ -177,6 +202,7 @@ public sealed class ModEntry : Mod
             CharacterValidationRepository characterValidationRepository = new(connectionFactory);
             CanonicalCharacterRepository canonicalCharacterRepository = new(connectionFactory);
             DialogueSourceRepository dialogueSourceRepository = new(connectionFactory);
+            ScanFileCacheRepository scanFileCacheRepository = new(connectionFactory);
             ScanOptions scanOptions = new()
             {
                 ScanTimeoutSeconds = this.config.ScanTimeoutSeconds,
@@ -188,6 +214,7 @@ public sealed class ModEntry : Mod
 
             if (this.config.EnableDynamicModScanning)
             {
+                var scheduleScanSw = System.Diagnostics.Stopwatch.StartNew();
                 CharacterSyncService characterSyncService = new(
                     characterRepository,
                     canonicalCharacterRepository,
@@ -207,31 +234,54 @@ public sealed class ModEntry : Mod
                     scannedModRepository,
                     loreConflictRepository,
                     scanHistoryRepository,
-                    new DialogueSourceScannerService(canonicalCharacterRepository, dialogueSourceRepository, null, scanOptions),
+                    null,
                     message => this.Monitor.Log(message, LogLevel.Info));
+                DialogueSourceScannerService deferredDialogueSourceScanner = new(
+                    canonicalCharacterRepository,
+                    dialogueSourceRepository,
+                    scanFileCacheRepository,
+                    scanOptions);
 
                 _ = Task.Run(async () =>
                 {
+                    var scanSw = System.Diagnostics.Stopwatch.StartNew();
                     ModScanSummary summary = await scanCoordinator.RunScanAsync("SMAPI Startup");
+                    scanSw.Stop();
                     this.Monitor.Log(
                         $"Living Lore scan complete: success={summary.Success}, mods={summary.ModsScanned}, vanilla={summary.VanillaCharactersFound}, modded={summary.ModdedCharactersFound}, canonical={summary.MergedCanonicalCharacters}, found={summary.CharactersFound}, added={summary.CharactersAdded}, updated={summary.CharactersUpdated}, reactivated={summary.CharactersReactivated}, inactive={summary.CharactersMarkedInactive}, conflicts={summary.ConflictsFound}.",
                         summary.Success ? LogLevel.Info : LogLevel.Warn);
+                    this.Monitor.Log($"[Startup Performance] Background SMAPI startup scan task: {scanSw.ElapsedMilliseconds} ms", LogLevel.Info);
 
                     foreach (string error in summary.Errors)
                         this.Monitor.Log($"Living Lore scan warning: {error}", LogLevel.Warn);
 
                     // Refresh the interception eligibility cache with the post-scan active set.
+                    var refreshSw = System.Diagnostics.Stopwatch.StartNew();
                     await this.RefreshActiveCharacterCacheAsync();
+                    refreshSw.Stop();
+                    this.Monitor.Log($"[Cache] ActiveCharacterNames: post-scan refresh, {this.activeCharacterNames.Count} reused, 0 rebuilt, duration={refreshSw.ElapsedMilliseconds} ms", LogLevel.Info);
+
+                    await this.RunDeferredDialogueSourceScanAsync(deferredDialogueSourceScanner);
                 });
+                scheduleScanSw.Stop();
+                deferredWorkScheduledMs += scheduleScanSw.ElapsedMilliseconds;
+                this.Monitor.Log($"[Startup Performance] Schedule background mod scan: {scheduleScanSw.ElapsedMilliseconds} ms", LogLevel.Info);
             }
 
             // Start the bundled localhost dashboard/API automatically when enabled. Failures here
             // are logged but never stop the mod from loading.
             if (this.config.EnableLocalDashboardAutoStart)
+            {
+                var scheduleDashboardSw = System.Diagnostics.Stopwatch.StartNew();
                 _ = Task.Run(this.StartDashboardAsync);
+                scheduleDashboardSw.Stop();
+                deferredWorkScheduledMs += scheduleDashboardSw.ElapsedMilliseconds;
+                this.Monitor.Log($"[Dashboard Startup] Schedule dashboard startup task: {scheduleDashboardSw.ElapsedMilliseconds} ms", LogLevel.Info);
+            }
 
             if (this.config.UseLocalWebApiForDialogue)
             {
+                var clientSw = System.Diagnostics.Stopwatch.StartNew();
                 HttpClient localApiHttpClient = new()
                 {
                     BaseAddress = new Uri(this.config.LocalWebApiBaseUrl),
@@ -241,16 +291,30 @@ public sealed class ModEntry : Mod
                     localApiHttpClient,
                     message => this.Monitor.Log(message, LogLevel.Info),
                     message => this.Monitor.Log(message, LogLevel.Warn));
+                clientSw.Stop();
+                blockingGameThreadMs += clientSw.ElapsedMilliseconds;
+                this.Monitor.Log($"[Startup Performance] Local API client initialization: {clientSw.ElapsedMilliseconds} ms", LogLevel.Info);
                 this.Monitor.Log($"Living Lore dialogue client READY. Requests go to {this.config.LocalWebApiBaseUrl}{(this.config.EnableLiveInGameDialogueGeneration ? "" : " (live generation DISABLED in config)")}.", LogLevel.Info);
+                totalSw.Stop();
+                this.Monitor.Log(
+                    $"[Startup Summary] Total Living Lore startup work: {totalSw.ElapsedMilliseconds} ms; Blocking game-thread work: {blockingGameThreadMs} ms; Deferred/background work scheduled: {deferredWorkScheduledMs} ms; Top bottlenecks: 1. Database initialization - {databaseInitSw.ElapsedMilliseconds} ms; 2. Active character cache prime - {activeCacheSw.ElapsedMilliseconds} ms; 3. Local API client initialization - {clientSw.ElapsedMilliseconds} ms.",
+                    LogLevel.Info);
                 return;
             }
 
+            var directApiSetupSw = System.Diagnostics.Stopwatch.StartNew();
             string? apiKey = Environment.GetEnvironmentVariable(this.config.OpenAiApiKeyEnvironmentVariable);
             if (string.IsNullOrWhiteSpace(apiKey))
             {
                 this.Monitor.Log(
                     $"OpenAI API key was not found. Set {this.config.OpenAiApiKeyEnvironmentVariable} before generating dialogue.",
                     LogLevel.Warn);
+                directApiSetupSw.Stop();
+                totalSw.Stop();
+                this.Monitor.Log($"[Startup Performance] Direct OpenAI API setup: {directApiSetupSw.ElapsedMilliseconds} ms", LogLevel.Info);
+                this.Monitor.Log(
+                    $"[Startup Summary] Total Living Lore startup work: {totalSw.ElapsedMilliseconds} ms; Blocking game-thread work: {blockingGameThreadMs + directApiSetupSw.ElapsedMilliseconds} ms; Deferred/background work scheduled: {deferredWorkScheduledMs} ms.",
+                    LogLevel.Info);
                 return;
             }
 
@@ -269,23 +333,36 @@ public sealed class ModEntry : Mod
                 openAiDialogueService,
                 this.config.MaxRecentMemories,
                 TimeSpan.FromMinutes(this.config.DialogueCacheMinutes));
+            directApiSetupSw.Stop();
+            blockingGameThreadMs += directApiSetupSw.ElapsedMilliseconds;
 
             this.Monitor.Log("Living Lore Dialogue initialized.", LogLevel.Info);
+            this.Monitor.Log($"[Startup Performance] Direct OpenAI API setup: {directApiSetupSw.ElapsedMilliseconds} ms", LogLevel.Info);
+            totalSw.Stop();
+            this.Monitor.Log(
+                $"[Startup Summary] Total Living Lore startup work: {totalSw.ElapsedMilliseconds} ms; Blocking game-thread work: {blockingGameThreadMs} ms; Deferred/background work scheduled: {deferredWorkScheduledMs} ms.",
+                LogLevel.Info);
         }
         catch (Exception ex)
         {
+            totalSw.Stop();
             this.Monitor.Log($"Failed to initialize Living Lore Dialogue: {ex}", LogLevel.Error);
+            this.Monitor.Log($"[Startup Summary] Total Living Lore startup work before failure: {totalSw.ElapsedMilliseconds} ms; Blocking game-thread work: {blockingGameThreadMs} ms; Deferred/background work scheduled: {deferredWorkScheduledMs} ms.", LogLevel.Warn);
         }
     }
 
     private async Task StartDashboardAsync()
     {
+        var dashboardSw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
+            var pathSw = System.Diagnostics.Stopwatch.StartNew();
             string relativePath = this.config.LocalDashboardRelativePath
                 .Replace('/', Path.DirectorySeparatorChar)
                 .Replace('\\', Path.DirectorySeparatorChar);
             string exePath = Path.Combine(this.Helper.DirectoryPath, relativePath);
+            pathSw.Stop();
+            this.Monitor.Log($"[Dashboard Startup] Resolve dashboard executable path: {pathSw.ElapsedMilliseconds} ms", LogLevel.Info);
 
             this.dashboardProcess = new DashboardProcessService(
                 exePath,
@@ -296,7 +373,10 @@ public sealed class ModEntry : Mod
                 message => this.Monitor.Log(message, LogLevel.Warn),
                 message => this.Monitor.Log(message, LogLevel.Error));
 
+            var ensureRunningSw = System.Diagnostics.Stopwatch.StartNew();
             DashboardProcessService.StartResult result = await this.dashboardProcess.EnsureRunningAsync();
+            ensureRunningSw.Stop();
+            this.Monitor.Log($"[Dashboard Startup] EnsureRunningAsync: {ensureRunningSw.ElapsedMilliseconds} ms", LogLevel.Info);
 
             if (result.Available && this.config.OpenDashboardBrowserOnLaunch)
                 this.OpenDashboardInBrowser();
@@ -308,6 +388,73 @@ public sealed class ModEntry : Mod
         {
             // Defensive: never let dashboard startup crash the game.
             this.Monitor.Log($"Unexpected error starting the local dashboard: {ex.Message}", LogLevel.Warn);
+        }
+        finally
+        {
+            dashboardSw.Stop();
+            this.Monitor.Log($"[Dashboard Startup] Total dashboard startup task: {dashboardSw.ElapsedMilliseconds} ms", LogLevel.Info);
+        }
+    }
+
+    private async Task RunDeferredDialogueSourceScanAsync(DialogueSourceScannerService scanner)
+    {
+        if (Interlocked.Exchange(ref this.deferredDialogueSourceScanStarted, 1) != 0)
+        {
+            this.Monitor.Log("[Startup Performance] Deferred dialogue source scan already scheduled; skipping duplicate request.", LogLevel.Trace);
+            return;
+        }
+
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            this.Monitor.Log(
+                $"[Startup Performance] Deferred dialogue source scan waiting for SaveLoaded + {DeferredDialogueSourceScanDelaySeconds}s.",
+                LogLevel.Info);
+
+            await this.saveLoadedForDeferredScans.Task;
+            await Task.Delay(TimeSpan.FromSeconds(DeferredDialogueSourceScanDelaySeconds));
+
+            string? configuredPath = this.GetConfiguredModsFolderPath();
+            if (string.IsNullOrWhiteSpace(configuredPath))
+            {
+                this.Monitor.Log("[Startup Performance] Deferred dialogue source scan skipped: Mods folder path is not configured.", LogLevel.Warn);
+                return;
+            }
+
+            string modsFolderPath = Path.GetFullPath(configuredPath);
+            if (!Directory.Exists(modsFolderPath))
+            {
+                this.Monitor.Log($"[Startup Performance] Deferred dialogue source scan skipped: Mods folder does not exist: {modsFolderPath}", LogLevel.Warn);
+                return;
+            }
+
+            var scanSw = System.Diagnostics.Stopwatch.StartNew();
+            DialogueSourceScanSummary dialogueScan = await scanner.ScanAsync(modsFolderPath);
+            scanSw.Stop();
+
+            foreach (string error in dialogueScan.Errors.Take(20))
+                this.Monitor.Log($"Deferred dialogue source scan warning: {error}", LogLevel.Warn);
+
+            this.Monitor.Log(
+                $"Deferred dialogue source scan complete: lines={dialogueScan.SourcesFound}, upserted={dialogueScan.SourcesUpserted}, cached={dialogueScan.FilesSkippedFromCache}, scanned={dialogueScan.FilesScanned}, deactivated={dialogueScan.SourcesDeactivated}, warnings={dialogueScan.Warnings.Count}, errors={dialogueScan.Errors.Count}.",
+                dialogueScan.TimedOut ? LogLevel.Warn : LogLevel.Info);
+            this.Monitor.Log($"[Startup Performance] Deferred dialogue source scan: {scanSw.ElapsedMilliseconds} ms, {dialogueScan.SourcesFound} line(s), {dialogueScan.FilesScanned} scanned, {dialogueScan.FilesSkippedFromCache} cached.", LogLevel.Info);
+            this.Monitor.Log($"[File Scan] Deferred dialogue source scan: {dialogueScan.TotalFilesQueued} files, {dialogueScan.FilesScanned} changed, {dialogueScan.FilesSkippedFromCache} skipped, duration={scanSw.ElapsedMilliseconds} ms.", LogLevel.Info);
+            this.Monitor.Log($"[Cache] Deferred dialogue source file cache: {(dialogueScan.FilesSkippedFromCache > 0 ? "hit" : "miss")}, {dialogueScan.FilesSkippedFromCache} reused, {dialogueScan.FilesScanned} rebuilt, duration={dialogueScan.CacheLookupMs + dialogueScan.CacheWriteMs} ms.", LogLevel.Info);
+            this.Monitor.Log($"[DB Write] Deferred dialogue source flush: {dialogueScan.SourcesUpserted} records in {dialogueScan.SourceFlushMs} ms, transaction=batch, lockWait=included-in-duration.", LogLevel.Info);
+            this.Monitor.Log($"[DB Write] Deferred dialogue source cached LastSeen: {dialogueScan.CachedSourcesMarkedSeen} records in {dialogueScan.CachedMarkSeenMs} ms, transaction=batch, lockWait=included-in-duration.", LogLevel.Info);
+            this.Monitor.Log($"[Startup Performance] Deferred dialogue source scan detail: dbRead={dialogueScan.DatabaseReadMs}ms, queue={dialogueScan.QueueDiscoveryMs}ms, cacheLookup={dialogueScan.CacheLookupMs}ms, parse={dialogueScan.ParseMs}ms, extract={dialogueScan.ExtractMs}ms, cacheWrite={dialogueScan.CacheWriteMs}ms, dbFlush={dialogueScan.SourceFlushMs}ms, cachedMarkSeen={dialogueScan.CachedMarkSeenMs}ms, deactivate={dialogueScan.DeactivateMs}ms, summaries={dialogueScan.SummaryRefreshMs}ms.", LogLevel.Info);
+            this.Monitor.Log(
+                $"[Startup Summary] Deferred dialogue source scan: Total Living Lore startup work: {totalSw.ElapsedMilliseconds} ms; Blocking game-thread work: 0 ms; Deferred/background work: {scanSw.ElapsedMilliseconds} ms; Top bottlenecks: 1. Dialogue source scan - {scanSw.ElapsedMilliseconds} ms; 2. Queue discovery - {dialogueScan.QueueDiscoveryMs} ms; 3. DB flush - {dialogueScan.SourceFlushMs} ms; 4. Cached LastSeen update - {dialogueScan.CachedMarkSeenMs} ms; 5. Summary refresh - {dialogueScan.SummaryRefreshMs} ms.",
+                LogLevel.Info);
+        }
+        catch (Exception ex)
+        {
+            this.Monitor.Log($"Deferred dialogue source scan failed: {ex.Message}", LogLevel.Warn);
+        }
+        finally
+        {
+            totalSw.Stop();
         }
     }
 
@@ -339,30 +486,55 @@ public sealed class ModEntry : Mod
 
     private void OnSaveLoaded(object? sender, SaveLoadedEventArgs e)
     {
+        var saveLoadedSw = System.Diagnostics.Stopwatch.StartNew();
+        long blockingGameThreadMs = 0;
+        long deferredWorkScheduledMs = 0;
         string playerName = SafeGet(() => Game1.player?.Name, "Unknown");
         string farmName = SafeGet(() => Game1.player?.farmName?.Value, "Unknown");
         string saveFile = SafeGet(() => Constants.SaveFolderName ?? string.Empty, "(unknown)");
         this.Monitor.Log($"[Event] SaveLoaded. Player='{playerName}', farm='{farmName}', saveFile='{saveFile}', location='{Game1.currentLocation?.NameOrUniqueName}'. Living Lore interaction detection is active.", LogLevel.Info);
+        this.saveLoadedForDeferredScans.TrySetResult(true);
+        var activeRefreshScheduleSw = System.Diagnostics.Stopwatch.StartNew();
         _ = Task.Run(this.RefreshActiveCharacterCacheAsync); // ensure the eligibility cache reflects the loaded save
+        activeRefreshScheduleSw.Stop();
+        deferredWorkScheduledMs += activeRefreshScheduleSw.ElapsedMilliseconds;
+        this.Monitor.Log($"[Startup Performance] Schedule SaveLoaded active character cache refresh: {activeRefreshScheduleSw.ElapsedMilliseconds} ms", LogLevel.Info);
+        var memoryBaselineSw = System.Diagnostics.Stopwatch.StartNew();
         this.ResetAutomaticMemoryBaselines(saveFile);
+        memoryBaselineSw.Stop();
+        blockingGameThreadMs += memoryBaselineSw.ElapsedMilliseconds;
+        this.Monitor.Log($"[Startup Performance] SaveLoaded memory baseline reset: {memoryBaselineSw.ElapsedMilliseconds} ms", LogLevel.Info);
 
         // Extract vanilla dialogue via SMAPI content API (synchronous on game thread) and register
         // with the server in the background so the prompt builder has canonical examples even when
         // no Content Patcher dialogue mods are installed.
+        long vanillaBlockingMs = 0;
         if (this.localDialogueApiClient is not null)
-            this.RegisterVanillaDialogue();
+            vanillaBlockingMs = this.RegisterVanillaDialogue();
+
+        blockingGameThreadMs += vanillaBlockingMs;
+        saveLoadedSw.Stop();
+        this.Monitor.Log(
+            $"[Startup Summary] Total Living Lore SaveLoaded work: {saveLoadedSw.ElapsedMilliseconds} ms; Blocking game-thread work: {blockingGameThreadMs} ms; Deferred/background work scheduled: {deferredWorkScheduledMs} ms; Top bottlenecks: 1. Vanilla dialogue extraction/cache - {vanillaBlockingMs} ms; 2. Memory baseline reset - {memoryBaselineSw.ElapsedMilliseconds} ms; 3. Active character cache refresh scheduling - {activeRefreshScheduleSw.ElapsedMilliseconds} ms.",
+            LogLevel.Info);
     }
 
     /// <summary>
     /// Loads vanilla character dialogue from the game's content via SMAPI's content pipeline
-    /// (must be called on the game thread), then fires off async HTTP registration to the server.
-    /// Sources are stored as StardewValley.Vanilla and are never deactivated by the mod scanner.
+    /// (must be called on the game thread), then registers with the server only the characters
+    /// whose dialogue changed since the previous save load.  Unchanged characters are identified
+    /// via a persistent content-hash cache stored in the mod's data folder, so subsequent loads
+    /// complete the check in milliseconds without any HTTP or database work.
     /// </summary>
-    private void RegisterVanillaDialogue()
+    private long RegisterVanillaDialogue()
     {
         if (this.localDialogueApiClient is null)
-            return;
+            return 0;
 
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+
+        // --- Content extraction (must run on game thread via SMAPI content pipeline) ---
+        var extractSw = System.Diagnostics.Stopwatch.StartNew();
         Dictionary<string, Dictionary<string, string>> extracted = new(StringComparer.OrdinalIgnoreCase);
         foreach (string name in VanillaVillagerNames)
         {
@@ -375,116 +547,139 @@ public sealed class ModEntry : Mod
             }
             catch
             {
-                // Some characters (e.g. Dwarf before progression) have no dialogue file; skip silently.
+                // Characters without a dialogue file (e.g. Dwarf before progression) are silently skipped.
             }
         }
+        extractSw.Stop();
 
         if (extracted.Count == 0)
         {
             this.Monitor.Log("[VanillaDialogue] No vanilla dialogue found to register; skipping.", LogLevel.Trace);
-            return;
+            return totalSw.ElapsedMilliseconds;
         }
 
-        int totalLines = extracted.Values.Sum(d => d.Count);
-        this.Monitor.Log($"[VanillaDialogue] Loaded {totalLines} line(s) for {extracted.Count} vanilla character(s); posting to server in background.", LogLevel.Info);
+        // --- Hash-based change detection ---
+        // The cache stores a short content hash per character.  If the hash matches the stored value
+        // (same game version + same extracted content) the character is skipped entirely — no HTTP
+        // call, no database work.  This handles the common case where nothing changed since the
+        // last load, especially important when a Content Patcher mod is not installed.
+        string currentVersion = Game1.version ?? "unknown";
+        var cacheReadSw = System.Diagnostics.Stopwatch.StartNew();
+        VanillaDialogueCacheFile? existingCache = this.Helper.Data.ReadJsonFile<VanillaDialogueCacheFile>("vanilla_dialogue_cache.json");
+        cacheReadSw.Stop();
+
+        bool cacheValid = existingCache is not null
+            && string.Equals(existingCache.GameVersion, currentVersion, StringComparison.OrdinalIgnoreCase)
+            && existingCache.Hashes is not null;
+
+        if (existingCache is null)
+            this.Monitor.Log("[Dialogue Cache] No cache file found; all characters will be registered.", LogLevel.Info);
+        else if (!cacheValid)
+            this.Monitor.Log($"[Dialogue Cache] Cache invalid (stored version={existingCache.GameVersion ?? "none"}, current={currentVersion}); all characters will be registered.", LogLevel.Info);
+        else
+            this.Monitor.Log($"[Dialogue Cache] Cache loaded: {existingCache.Hashes!.Count} character(s) cached, game version={currentVersion}.", LogLevel.Info);
+
+        Dictionary<string, string> storedHashes = cacheValid
+            ? new(existingCache!.Hashes!, StringComparer.OrdinalIgnoreCase)
+            : new(StringComparer.OrdinalIgnoreCase);
+
+        var toRegister = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        var currentHashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        int unchangedCount = 0;
+        int unchangedLines = 0;
+
+        var hashSw = System.Diagnostics.Stopwatch.StartNew();
+        foreach (KeyValuePair<string, Dictionary<string, string>> pair in extracted)
+        {
+            string hash = ComputeDialogueHash(pair.Value);
+            currentHashes[pair.Key] = hash;
+
+            if (storedHashes.TryGetValue(pair.Key, out string? stored) && stored == hash)
+            {
+                unchangedCount++;
+                unchangedLines += pair.Value.Count;
+                if (this.config.DebugLogging)
+                    this.Monitor.Log($"[VanillaDialogue] '{pair.Key}': unchanged (cache hit, {pair.Value.Count} lines).", LogLevel.Trace);
+            }
+            else
+            {
+                toRegister[pair.Key] = pair.Value;
+                if (this.config.DebugLogging)
+                    this.Monitor.Log($"[VanillaDialogue] '{pair.Key}': changed or new, will register ({pair.Value.Count} lines).", LogLevel.Trace);
+            }
+        }
+
+        hashSw.Stop();
+
+        int changedLines = toRegister.Values.Sum(d => d.Count);
+        this.Monitor.Log($"[Dialogue Cache] {unchangedCount} character(s) unchanged, {toRegister.Count} to register ({changedLines} lines).", LogLevel.Info);
+        this.Monitor.Log(
+            $"[Cache] Vanilla dialogue cache: {(cacheValid ? "hit" : "miss")}, {unchangedCount} reused, {toRegister.Count} rebuilt, duration={cacheReadSw.ElapsedMilliseconds + hashSw.ElapsedMilliseconds} ms",
+            LogLevel.Info);
+
+        if (toRegister.Count == 0)
+        {
+            this.Monitor.Log(
+                $"[Startup Performance] Vanilla dialogue cache: {unchangedCount} characters unchanged, 0 rebuilt, {unchangedLines} cached lines reused. " +
+                $"Extract={extractSw.ElapsedMilliseconds}ms, total={totalSw.ElapsedMilliseconds}ms.",
+                LogLevel.Info);
+            return totalSw.ElapsedMilliseconds;
+        }
+
+        this.Monitor.Log(
+            $"[VanillaDialogue] {unchangedCount} unchanged (skipped), {toRegister.Count} to register ({changedLines} lines). Extract={extractSw.ElapsedMilliseconds}ms.",
+            LogLevel.Info);
 
         LocalDialogueApiClient client = this.localDialogueApiClient;
         _ = Task.Run(async () =>
         {
-            foreach (KeyValuePair<string, Dictionary<string, string>> pair in extracted)
-            {
+            var regSw = System.Diagnostics.Stopwatch.StartNew();
+
+            foreach (KeyValuePair<string, Dictionary<string, string>> pair in toRegister)
                 await client.RegisterVanillaDialogueAsync(pair.Key, pair.Value);
+
+            regSw.Stop();
+
+            this.Monitor.Log(
+                $"[Startup Performance] Vanilla dialogue registration: {toRegister.Count} character(s), {changedLines} line(s) in {regSw.ElapsedMilliseconds}ms.",
+                LogLevel.Info);
+            this.Monitor.Log(
+                $"[Startup Performance] Total vanilla dialogue initialization: extract={extractSw.ElapsedMilliseconds}ms, registration={regSw.ElapsedMilliseconds}ms, total={totalSw.ElapsedMilliseconds}ms. " +
+                $"Cache: {unchangedCount} unchanged ({unchangedLines} lines), {toRegister.Count} rebuilt ({changedLines} lines).",
+                LogLevel.Info);
+
+            // Persist the updated hash cache after successful registration so subsequent loads can skip.
+            var cacheWriteSw = System.Diagnostics.Stopwatch.StartNew();
+            VanillaDialogueCacheFile updatedCache = new()
+            {
+                GameVersion = currentVersion,
+                Hashes = new Dictionary<string, string>(storedHashes, StringComparer.OrdinalIgnoreCase)
+            };
+            foreach (KeyValuePair<string, string> kv in currentHashes)
+                updatedCache.Hashes[kv.Key] = kv.Value;
+
+            try
+            {
+                this.Helper.Data.WriteJsonFile("vanilla_dialogue_cache.json", updatedCache);
+                cacheWriteSw.Stop();
+                this.Monitor.Log($"[Cache] Vanilla dialogue cache write: updated, {currentHashes.Count} reused, {toRegister.Count} rebuilt, duration={cacheWriteSw.ElapsedMilliseconds} ms", LogLevel.Info);
+                if (this.config.DebugLogging)
+                    this.Monitor.Log($"[VanillaDialogue] Hash cache written for {currentHashes.Count} character(s).", LogLevel.Trace);
+            }
+            catch (Exception ex)
+            {
+                cacheWriteSw.Stop();
+                this.Monitor.Log($"[VanillaDialogue] Cache write failed: {ex.Message}", LogLevel.Warn);
+                this.Monitor.Log($"[Cache] Vanilla dialogue cache write: failed, {currentHashes.Count} reused, {toRegister.Count} rebuilt, duration={cacheWriteSw.ElapsedMilliseconds} ms", LogLevel.Warn);
             }
         });
+        return totalSw.ElapsedMilliseconds;
     }
 
     private void OnWarped(object? sender, WarpedEventArgs e)
     {
         if (this.config.DebugLogging)
             this.Monitor.Log($"[Event] Player warped to '{e.NewLocation?.NameOrUniqueName}' with {CountVillagers(e.NewLocation)} villager(s).", LogLevel.Trace);
-    }
-
-    private void OnRenderedActiveMenu(object? sender, RenderedActiveMenuEventArgs e)
-    {
-        try
-        {
-            if (this.activeBranchingSession?.IsActive != true || this.activeBranchingNpc is null)
-                return;
-
-            this.DrawBranchingNpcPortrait(e.SpriteBatch, this.activeBranchingSession, this.activeBranchingNpc);
-        }
-        catch (Exception ex)
-        {
-            if (this.config.DebugLogging)
-                this.Monitor.Log($"[BranchingUI] Failed to draw persistent NPC portrait: {ex.Message}", LogLevel.Trace);
-        }
-    }
-
-    private void DrawBranchingNpcPortrait(SpriteBatch spriteBatch, BranchingDialogueSession session, NPC npc)
-    {
-        Texture2D? portrait = TryGetNpcPortrait(npc);
-
-        if (portrait is null)
-            return;
-
-        int scale = 4;
-        int portraitSize = 64 * scale;
-        int margin = 48;
-        int x = Math.Max(margin, Game1.uiViewport.Width - portraitSize - margin);
-        int y = 96;
-        Rectangle panel = new(x - 16, y - 52, portraitSize + 32, portraitSize + 76);
-
-        IClickableMenu.drawTextureBox(
-            spriteBatch,
-            Game1.menuTexture,
-            new Rectangle(0, 256, 60, 60),
-            panel.X,
-            panel.Y,
-            panel.Width,
-            panel.Height,
-            Color.White,
-            1f,
-            drawShadow: true);
-
-        spriteBatch.Draw(
-            portrait,
-            new Rectangle(x, y, portraitSize, portraitSize),
-            new Rectangle(0, 0, 64, 64),
-            Color.White);
-
-        string name = string.IsNullOrWhiteSpace(session.NpcDisplayName) ? npc.displayName ?? npc.Name : session.NpcDisplayName;
-        Vector2 nameSize = Game1.smallFont.MeasureString(name);
-        Utility.drawTextWithShadow(
-            spriteBatch,
-            name,
-            Game1.smallFont,
-            new Vector2(panel.Center.X - nameSize.X / 2f, panel.Y + 16),
-            Game1.textColor);
-    }
-
-    private static Texture2D? TryGetNpcPortrait(NPC npc)
-    {
-        try
-        {
-            const System.Reflection.BindingFlags flags =
-                System.Reflection.BindingFlags.Public |
-                System.Reflection.BindingFlags.NonPublic |
-                System.Reflection.BindingFlags.Instance;
-
-            System.Reflection.PropertyInfo? property = npc.GetType().GetProperty("Portrait", flags);
-            if (property?.GetValue(npc) is Texture2D propertyPortrait)
-                return propertyPortrait;
-
-            System.Reflection.FieldInfo? field = npc.GetType().GetField("Portrait", flags);
-            if (field?.GetValue(npc) is Texture2D fieldPortrait)
-                return fieldPortrait;
-        }
-        catch
-        {
-            // Portraits are visual polish; missing/renamed portrait members should not break dialogue.
-        }
-
-        return null;
     }
 
     // Runs every tick on the game thread; flush any dialogue queued by background generation tasks.
@@ -1155,24 +1350,95 @@ public sealed class ModEntry : Mod
 
         _ = Task.Run(async () =>
         {
-            BranchingDialogueResponse? response = this.localDialogueApiClient is null
+            this.Monitor.Log(
+                $"[Branching] ◆ API REQUEST STARTED session={session.SessionId}, npc={session.NpcName}, " +
+                $"turn={session.TurnCount}, mode={mode}, selected=\"{Preview(selectedOption?.Text ?? "(none)")}\", " +
+                $"historyTurns={request.History.Count}, clientReady={this.localDialogueApiClient is not null}.",
+                LogLevel.Info);
+
+            BranchingDialogueResponse? apiResponse = this.localDialogueApiClient is null
                 ? null
                 : await this.localDialogueApiClient.GenerateBranchingAsync(request, "SMAPI-Branching");
 
-            response ??= CreateFallbackBranchingResponse(mode);
-            EnsureFiveBranchingOptions(response, mode);
-            if (!string.IsNullOrWhiteSpace(response.Error))
-                this.Monitor.Log($"[Branching] API request returned fallback/error session={session.SessionId}: {response.Error}", LogLevel.Warn);
+            this.Monitor.Log(
+                $"[Branching] ◆ API RESPONSE RECEIVED session={session.SessionId}, npc={session.NpcName}, " +
+                $"turn={session.TurnCount}, mode={mode}, responseNull={apiResponse is null}, " +
+                $"hasError={!string.IsNullOrWhiteSpace(apiResponse?.Error)}, " +
+                $"npcResponseEmpty={string.IsNullOrWhiteSpace(apiResponse?.NpcResponse)}, " +
+                $"optionCount={apiResponse?.PlayerOptions.Count ?? 0}.",
+                LogLevel.Info);
+
+            BranchingDialogueResponse response;
+            if (apiResponse is null)
+            {
+                // HTTP call failed, server returned non-success, or response body could not be parsed.
+                this.Monitor.Log(
+                    $"[Branching] FALLBACK TRIGGERED: API client returned null. " +
+                    $"session={session.SessionId}, npc={session.NpcName}, turn={session.TurnCount}, mode={mode}, " +
+                    $"selectedOption=\"{Preview(selectedOption?.Text ?? "(none)")}\". " +
+                    $"See [Branching request]/[Branching response] log lines above for HTTP status, response body, or exception.",
+                    LogLevel.Warn);
+                response = CreateFallbackBranchingResponse(mode, this.config.DebugLogging);
+            }
             else
-                this.Monitor.Log($"[Branching] API request success session={session.SessionId}, mode={mode}, options={response.PlayerOptions.Count}.", LogLevel.Info);
+            {
+                // Raw response received — log before any further processing.
+                this.Monitor.Log(
+                    $"[Branching] Raw API Response: npcResponse=\"{Preview(apiResponse.NpcResponse, 200)}\", " +
+                    $"options={apiResponse.PlayerOptions.Count}, conversationShouldEnd={apiResponse.ConversationShouldEnd}, " +
+                    $"error=\"{apiResponse.Error}\".",
+                    LogLevel.Info);
+
+                if (!string.IsNullOrWhiteSpace(apiResponse.Error))
+                {
+                    this.Monitor.Log(
+                        $"[Branching] FALLBACK TRIGGERED because: Server returned error response. " +
+                        $"session={session.SessionId}, npc={session.NpcName}, turn={session.TurnCount}, " +
+                        $"error={apiResponse.Error}",
+                        LogLevel.Warn);
+
+                    // Replace any fake NPC dialogue that the server may have included with a
+                    // neutral phrase so errors are never silently mistaken for real content.
+                    bool isOpening = mode.Equals("opening_options", StringComparison.OrdinalIgnoreCase);
+                    apiResponse.NpcResponse = isOpening ? ""
+                        : this.config.DebugLogging ? $"[Debug: {apiResponse.Error}]"
+                        : "The conversation falters for a moment.";
+                }
+                else
+                {
+                    this.Monitor.Log(
+                        $"[Branching] API success: session={session.SessionId}, npc={session.NpcName}, " +
+                        $"turn={session.TurnCount}, mode={mode}, options={apiResponse.PlayerOptions.Count}.",
+                        LogLevel.Info);
+                }
+
+                response = apiResponse;
+            }
+
+            EnsureFiveBranchingOptions(response, mode);
+            this.Monitor.Log(
+                $"[Branching] Final response to display: session={session.SessionId}, " +
+                $"npcResponse=\"{Preview(response.NpcResponse, 200)}\", options={response.PlayerOptions.Count}.",
+                LogLevel.Info);
 
             this.mainThreadActions.Enqueue(() =>
             {
                 if (!Context.IsWorldReady || this.activeBranchingSession != session || requestId != this.pendingRequestId || !session.IsActive)
                 {
-                    this.Monitor.Log($"[Branching] Discarded response for inactive/superseded session={session.SessionId}.", LogLevel.Info);
+                    this.Monitor.Log(
+                        $"[Branching] ◆ RESPONSE DISCARDED session={session.SessionId}, npc={session.NpcName}, turn={session.TurnCount}, mode={mode}. " +
+                        $"Guards: worldReady={Context.IsWorldReady}, sessionMatch={this.activeBranchingSession == session}, " +
+                        $"requestIdMatch={requestId == this.pendingRequestId} (got={requestId} expected={this.pendingRequestId}), " +
+                        $"sessionActive={session.IsActive}.",
+                        LogLevel.Warn);
                     return;
                 }
+
+                this.Monitor.Log(
+                    $"[Branching] ◆ NPC RESPONSE RECEIVED session={session.SessionId}, npc={session.NpcName}, " +
+                    $"turn={session.TurnCount}, mode={mode}, npcResponse=\"{Preview(response.NpcResponse, 80)}\", " +
+                    $"options={response.PlayerOptions.Count}, conversationShouldEnd={response.ConversationShouldEnd}.",
+                    LogLevel.Info);
 
                 if (response.PlayerOptions.Count == 0)
                 {
@@ -1220,6 +1486,7 @@ public sealed class ModEntry : Mod
         string npcResponse,
         IReadOnlyList<PlayerDialogueOption> options)
     {
+        bool wasOpeningLoad = this.branchingUiState == BranchingUiState.OpeningOptionsLoading;
         this.ApplyBranchingConversationLock("show options");
         this.branchingAwaitingResponse = false;
         this.branchingUiState = BranchingUiState.ShowingPlayerOptions;
@@ -1243,7 +1510,11 @@ public sealed class ModEntry : Mod
         Game1.currentSpeaker = npc;
         this.suppressActionUntil = DateTime.UtcNow.AddMilliseconds(PostDisplaySuppressionMs);
         this.suppressionWindowActive = true;
-        this.Monitor.Log($"[Branching] Displayed options session={session.SessionId}, npc={session.NpcName}, prompt={Preview(prompt)}, options={options.Count}.", LogLevel.Info);
+        this.Monitor.Log(
+            wasOpeningLoad
+                ? $"[Branching] ◆ OPENING OPTIONS DISPLAYED session={session.SessionId}, npc={session.NpcName}, turn={session.TurnCount}, options={options.Count}."
+                : $"[Branching] ◆ FOLLOWUP OPTIONS DISPLAYED session={session.SessionId}, npc={session.NpcName}, turn={session.TurnCount}, options={options.Count}.",
+            LogLevel.Info);
     }
 
     private void ShowBranchingNpcTyping(
@@ -1274,7 +1545,11 @@ public sealed class ModEntry : Mod
             npc.CurrentDialogue.Push(dialogue);
             Game1.currentSpeaker = npc;
             Game1.drawDialogue(npc);
-            this.Monitor.Log($"[Branching] NPC typing started session={session.SessionId}, npc={session.NpcName}, response={Preview(this.pendingBranchingNpcResponse)}, nextOptions={this.pendingBranchingOptions.Count}, endReason={endReason ?? "(none)"}.", LogLevel.Info);
+            this.Monitor.Log(
+                $"[Branching] ◆ DISPLAYING NPC RESPONSE session={session.SessionId}, npc={session.NpcName}, " +
+                $"turn={session.TurnCount}, response=\"{Preview(this.pendingBranchingNpcResponse)}\", " +
+                $"nextOptions={this.pendingBranchingOptions.Count}, endReason={endReason ?? "(none)"}.",
+                LogLevel.Info);
         }
         catch (Exception ex)
         {
@@ -1319,43 +1594,77 @@ public sealed class ModEntry : Mod
 
     private bool IsBranchingNpcTypingComplete()
     {
-        if (Game1.activeClickableMenu is not DialogueBox)
-            return (DateTime.UtcNow - this.branchingTypingStartedAt).TotalMilliseconds > 250;
-
-        string current = GetCurrentDialogueText();
-        if (string.IsNullOrWhiteSpace(current))
+        // Keep waiting while the NPC dialogue box is still on screen.
+        // Reset the clock every tick so the 250ms settling delay starts from the moment
+        // the player dismisses the box, not from when it opened.
+        if (Game1.activeClickableMenu is DialogueBox)
+        {
+            this.branchingTypingStartedAt = DateTime.UtcNow;
             return false;
+        }
 
-        string expected = NormalizeDialogueForCompletion(this.pendingBranchingNpcResponse);
-        string shown = NormalizeDialogueForCompletion(current);
-        return shown.Length >= expected.Length;
+        // Dialogue dismissed (or never opened); short delay before showing the options panel.
+        return (DateTime.UtcNow - this.branchingTypingStartedAt).TotalMilliseconds > 250;
     }
 
     private void EnterBranchingWaitingState(BranchingDialogueSession session, NPC npc, string reason)
     {
         if (!Context.IsWorldReady || this.activeBranchingSession != session || !session.IsActive)
+        {
+            this.Monitor.Log(
+                $"[Branching] ◆ WAITING STATE SKIPPED (guard failed) session={session.SessionId}, npc={session.NpcName}, reason={reason}. " +
+                $"worldReady={Context.IsWorldReady}, sessionMatch={this.activeBranchingSession == session}, sessionActive={session.IsActive}.",
+                LogLevel.Warn);
             return;
+        }
 
         this.ApplyBranchingConversationLock("waiting for response");
         this.branchingAwaitingResponse = true;
-        this.branchingUiState = BranchingUiState.WaitingForApiResponse;
         Game1.currentSpeaker = npc;
 
-        if (Game1.activeClickableMenu is null && this.activeBranchingOptions.Count > 0)
+        if (this.activeBranchingOptions.Count == 0)
         {
-            Response[] responses = this.activeBranchingOptions
-                .Select(option => new Response(option.Id, option.Text))
-                .ToArray();
-            string prompt = string.IsNullOrWhiteSpace(this.activeBranchingPrompt)
-                ? $"Talk to {session.NpcDisplayName}:"
-                : this.activeBranchingPrompt;
-            Game1.currentLocation.createQuestionDialogue(prompt, responses, this.OnBranchingOptionSelected);
-            Game1.currentSpeaker = npc;
+            // Initial load: no options exist yet — show "..." so the player is never left staring
+            // at a frozen screen while opening options are generated.
+            this.branchingUiState = BranchingUiState.OpeningOptionsLoading;
+            if (Game1.activeClickableMenu is not null)
+                Game1.exitActiveMenu();
+            Game1.activeClickableMenu = new DialogueBox("...");
+            this.Monitor.Log(
+                $"[Branching] ◆ OPENING OPTIONS LOADING session={session.SessionId}, npc={session.NpcName}, turn={session.TurnCount}.",
+                LogLevel.Info);
         }
+        else
+        {
+            // Post-selection: the question-dialogue callback closes the menu after firing, so we
+            // queue a reopen on the next tick to keep the options visible while the NPC response
+            // is being generated. The branchingAwaitingResponse guard in OnBranchingOptionSelected
+            // prevents the player from re-selecting while waiting.
+            this.branchingUiState = BranchingUiState.WaitingForApiResponse;
+            this.Monitor.Log(
+                $"[Branching] ◆ WAITING FOR NPC RESPONSE, KEEPING OPTIONS UI VISIBLE session={session.SessionId}, npc={session.NpcName}, turn={session.TurnCount}.",
+                LogLevel.Info);
+            this.mainThreadActions.Enqueue(() =>
+            {
+                if (this.branchingUiState != BranchingUiState.WaitingForApiResponse
+                    || !session.IsActive
+                    || this.activeBranchingSession != session
+                    || Game1.activeClickableMenu is not null)
+                    return;
 
-        this.Monitor.Log(
-            $"[Branching] Waiting for API response session={session.SessionId}, npc={session.NpcName}, reason={reason}, keeping current menu={Game1.activeClickableMenu?.GetType().Name ?? "(none)"} visible.",
-            LogLevel.Info);
+                Response[] responses = this.activeBranchingOptions
+                    .Select(option => new Response(option.Id, option.Text))
+                    .ToArray();
+                string prompt = string.IsNullOrWhiteSpace(this.activeBranchingPrompt)
+                    ? $"Talk to {session.NpcDisplayName}:"
+                    : this.activeBranchingPrompt;
+                Game1.currentLocation.createQuestionDialogue(prompt, responses, this.OnBranchingOptionSelected);
+                Game1.currentSpeaker = npc;
+                this.Monitor.Log(
+                    $"[Branching] Options menu restored (waiting for NPC response) session={session.SessionId}, npc={npc.Name}.",
+                    LogLevel.Info);
+            });
+        }
     }
 
     private void OnBranchingOptionSelected(Farmer who, string answer)
@@ -1367,7 +1676,10 @@ public sealed class ModEntry : Mod
 
         if (this.branchingAwaitingResponse || this.branchingUiState is BranchingUiState.WaitingForApiResponse or BranchingUiState.TypingNpcResponse)
         {
-            this.Monitor.Log($"[Branching] Ignored option selection while awaiting API response session={session.SessionId}, answer={answer}.", LogLevel.Trace);
+            this.Monitor.Log(
+                $"[Branching] ◆ OPTION IGNORED (awaiting response) session={session.SessionId}, npc={npc.Name}, answer=\"{answer}\", " +
+                $"branchingAwaitingResponse={this.branchingAwaitingResponse}, uiState={this.branchingUiState}.",
+                LogLevel.Warn);
             return;
         }
 
@@ -1389,6 +1701,10 @@ public sealed class ModEntry : Mod
         }
 
         string mode = selected.IsNpcInitiates ? "npc_initiates" : "turn";
+        this.Monitor.Log(
+            $"[Branching] ◆ PLAYER OPTION SELECTED session={session.SessionId}, npc={npc.Name}, " +
+            $"turn={session.TurnCount}, option=\"{selected.Text}\" (id={selected.Id}, mode={mode}).",
+            LogLevel.Info);
         this.branchingUiState = BranchingUiState.WaitingForApiResponse;
         this.RequestBranchingAsync(session, npc, mode, selected, this.pendingRequestId);
     }
@@ -1437,7 +1753,7 @@ public sealed class ModEntry : Mod
         this.branchingCleanupInProgress = false;
     }
 
-    private static BranchingDialogueResponse CreateFallbackBranchingResponse(string mode)
+    private static BranchingDialogueResponse CreateFallbackBranchingResponse(string mode, bool debugLogging = false)
     {
         if (mode.Equals("opening_options", StringComparison.OrdinalIgnoreCase))
         {
@@ -1455,9 +1771,15 @@ public sealed class ModEntry : Mod
             };
         }
 
+        // Use a neutral phrase that does not look like real NPC dialogue; a debug build shows
+        // the actual failure reason so it is never silently confused with valid content.
+        string npcResponse = debugLogging
+            ? "[Debug: API call failed — check SMAPI log for details]"
+            : "The conversation falters for a moment.";
+
         return new BranchingDialogueResponse
         {
-            NpcResponse = "Let's talk about something simple for now.",
+            NpcResponse = npcResponse,
             PlayerOptions = new[]
             {
                 new PlayerDialogueOption { Id = "fallback_continue", Text = "That's okay.", Action = "choose" },
@@ -2342,6 +2664,23 @@ public sealed class ModEntry : Mod
         string modsFolderPath = this.GetConfiguredModsFolderPath();
         DirectoryInfo? gameDirectory = Directory.GetParent(modsFolderPath);
         return gameDirectory?.FullName ?? modsFolderPath;
+    }
+
+    // Produces a short deterministic hash of a dialogue dictionary so we can detect changes
+    // between save loads without storing the full content.  Sorted by key so enumeration order
+    // does not affect the result.  The first 16 hex chars (64-bit) of SHA256 are sufficient for
+    // a cache-validity check where collisions have no security consequence.
+    private static string ComputeDialogueHash(Dictionary<string, string> entries)
+    {
+        string combined = string.Join("\n", entries.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value}"));
+        byte[] hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(combined));
+        return Convert.ToHexString(hash)[..16];
+    }
+
+    private sealed class VanillaDialogueCacheFile
+    {
+        public string? GameVersion { get; set; }
+        public Dictionary<string, string> Hashes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     }
 }
 

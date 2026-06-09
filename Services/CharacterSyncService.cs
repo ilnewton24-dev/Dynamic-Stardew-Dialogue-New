@@ -35,9 +35,16 @@ public sealed class CharacterSyncService
     {
         CharacterSyncSummary summary = new();
         DateTime timestamp = DateTime.UtcNow;
+
+        var readSw = System.Diagnostics.Stopwatch.StartNew();
         IReadOnlyList<Character> originalCharacters = await this.characterRepository.GetAllWithSourceAsync();
+        readSw.Stop();
+
         List<Character> knownCharacters = originalCharacters.ToList();
         HashSet<long> seenCharacterIds = new();
+        int unchangedCount = 0;
+        var pendingUpdates = new List<(long CharacterId, ScannedCharacter Scanned)>();
+        long historyWriteMs = 0;
 
         foreach (ScannedCharacter scanned in scannedCharacters)
         {
@@ -63,9 +70,14 @@ public sealed class CharacterSyncService
             seenCharacterIds.Add(existing.Id);
             bool changed = HasChanged(existing, scannedForSync);
             bool reactivated = !existing.IsActive;
+            // A canonical ID resolved for the first time still needs a write even when no
+            // fingerprint/version field changed — otherwise the assignment is lost on next scan.
+            bool canonicalIdAssigned = existing.CanonicalCharacterId is null && scannedForSync.CanonicalCharacterId is not null;
+            bool needsWrite = changed || reactivated || canonicalIdAssigned;
 
             if (changed || reactivated)
             {
+                var historySw = System.Diagnostics.Stopwatch.StartNew();
                 await this.historyRepository.AddAsync(
                     existing.Id,
                     JsonSerializer.Serialize(existing),
@@ -76,16 +88,35 @@ public sealed class CharacterSyncService
                 foreach ((string field, string? oldValue, string? newValue) in Diff(existing, scannedForSync))
                     await this.changeLogRepository.AddAsync(existing.Id, scannedForSync.SourceModId, field, oldValue, newValue, timestamp);
 
+                historySw.Stop();
+                historyWriteMs += historySw.ElapsedMilliseconds;
+
                 if (reactivated)
                     summary.CharactersReactivated++;
                 else
                     summary.CharactersUpdated++;
             }
 
-            await this.characterRepository.UpdateFromScanAsync(existing.Id, scannedForSync);
-            ReplaceKnownCharacter(knownCharacters, existing.Id, scannedForSync);
+            if (needsWrite)
+            {
+                // Queue for the batched UPDATE below — avoids one exclusive lock per character.
+                pendingUpdates.Add((existing.Id, scannedForSync));
+                ReplaceKnownCharacter(knownCharacters, existing.Id, scannedForSync);
+            }
+            else
+            {
+                unchangedCount++;
+            }
         }
 
+        // All pending character updates in one connection + one transaction.
+        var batchSw = System.Diagnostics.Stopwatch.StartNew();
+        await this.characterRepository.BatchUpdateFromScanAsync(pendingUpdates);
+        batchSw.Stop();
+        this.log?.Invoke(
+            $"[DB Write] Character sync batch update: {pendingUpdates.Count} records in {batchSw.ElapsedMilliseconds} ms, transaction=batch, lockWait=included-in-duration. read={readSw.ElapsedMilliseconds}ms, history={historyWriteMs}ms, unchanged={unchangedCount}.");
+
+        var inactiveSw = System.Diagnostics.Stopwatch.StartNew();
         foreach (Character existing in originalCharacters)
         {
             if (!existing.IsActive || string.IsNullOrWhiteSpace(existing.SourceModId))
@@ -99,6 +130,9 @@ public sealed class CharacterSyncService
             await this.changeLogRepository.AddAsync(existing.Id, existing.SourceModId, "IsActive", "true", "false", timestamp);
             summary.CharactersMarkedInactive++;
         }
+        inactiveSw.Stop();
+        this.log?.Invoke(
+            $"[DB Write] Character inactive reconciliation: {summary.CharactersMarkedInactive} records in {inactiveSw.ElapsedMilliseconds} ms, transaction=per-record, lockWait=included-in-duration.");
 
         summary.ActiveCharactersInDatabase = await this.characterRepository.CountByActiveStatusAsync(true);
         int inactive = await this.characterRepository.CountByActiveStatusAsync(false);
